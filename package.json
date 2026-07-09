@@ -1,0 +1,23 @@
+{
+  "name": "quantum-contribution-worker",
+  "version": "1.0.0",
+  "description": "Standalone worker that snapshots GitHub contribution data into the ranking DB before GitHub's public events API expires it.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "sweep": "node index.js --once",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop contribution-worker",
+    "pm2:restart": "pm2 restart contribution-worker",
+    "pm2:logs": "pm2 logs contribution-worker",
+    "pm2:status": "pm2 status contribution-worker"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "mongoose": "^8.0.3",
+    "pm2": "^5.4.3"
+  }
+}
