@@ -1,7 +1,9 @@
 const mongoose = require("mongoose");
 
-const DELAY_BETWEEN_USERS_MS = 1500;
+// 2.5s keeps the PR search under GitHub's 30 search requests/min limit.
+const DELAY_BETWEEN_USERS_MS = 2500;
 const EVENT_PAGES = [1, 2, 3];
+const PR_SEARCH_MAX_PAGES = 3;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -66,10 +68,7 @@ const enumerateUsernames = async ({ quantumConn, rankingConn }) => {
   return [...usernames.values()];
 };
 
-// ─── GitHub fetchers ─────────────────────────────────────────────────────────
-// Per-day commit/PR detail from the public events API (~90 days / 300 events).
-// Same logic as fetchPublicEventDetails in backend/routes/github.js.
-const fetchEventDetails = async (username) => {
+const githubHeaders = () => {
   const headers = {
     Accept: "application/vnd.github+json",
     "User-Agent": "QuantumCommunity-ContributionWorker",
@@ -77,6 +76,14 @@ const fetchEventDetails = async (username) => {
   if (process.env.GITHUB_TOKEN) {
     headers.Authorization = `token ${process.env.GITHUB_TOKEN}`;
   }
+  return headers;
+};
+
+// ─── GitHub fetchers ─────────────────────────────────────────────────────────
+// Per-day commit/PR detail from the public events API (~90 days / 300 events).
+// Same logic as fetchPublicEventDetails in backend/routes/github.js.
+const fetchEventDetails = async (username) => {
+  const headers = githubHeaders();
 
   const pages = await Promise.allSettled(
     EVENT_PAGES.map((page) =>
@@ -88,6 +95,9 @@ const fetchEventDetails = async (username) => {
   );
 
   const detailsByDate = new Map();
+  // Oldest event of ANY type marks how far back the events API actually
+  // covers for this user — persisted as the coverage boundary.
+  let oldestEventDate = null;
   for (const result of pages) {
     if (result.status !== "fulfilled" || !result.value.ok) continue;
 
@@ -98,6 +108,7 @@ const fetchEventDetails = async (username) => {
       for (const event of events) {
         const date = event.created_at?.slice(0, 10);
         if (!date) continue;
+        if (!oldestEventDate || date < oldestEventDate) oldestEventDate = date;
 
         const detail =
           detailsByDate.get(date) || { date, commits: 0, pullRequests: 0 };
@@ -112,7 +123,55 @@ const fetchEventDetails = async (username) => {
     } catch {}
   }
 
-  return detailsByDate;
+  return { detailsByDate, oldestEventDate };
+};
+
+// Full-year PR history via the search API — unlike the events API this has
+// no ~90-day retention limit, so old PRs keep their ×5 points.
+const fetchPullRequestHistory = async (username) => {
+  const prsByDate = new Map();
+  const from = new Date();
+  from.setUTCDate(from.getUTCDate() - 364);
+  const fromKey = from.toISOString().slice(0, 10);
+  const query = `type:pr author:${username} created:>=${fromKey}`;
+  let retried = false;
+
+  for (let page = 1; page <= PR_SEARCH_MAX_PAGES; page++) {
+    let res;
+    try {
+      res = await fetch(
+        `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=100&page=${page}`,
+        { headers: githubHeaders(), signal: AbortSignal.timeout(10000) }
+      );
+    } catch {
+      break;
+    }
+
+    // Search rate limit (30/min with token) — wait for the window to reset
+    // and retry this page once.
+    if (res.status === 403 || res.status === 429) {
+      if (retried) break;
+      retried = true;
+      await sleep(65000);
+      page -= 1;
+      continue;
+    }
+    if (!res.ok) break;
+
+    try {
+      const json = await res.json();
+      const items = Array.isArray(json?.items) ? json.items : [];
+      for (const pr of items) {
+        const date = pr.created_at?.slice(0, 10);
+        if (date) prsByDate.set(date, (prsByDate.get(date) || 0) + 1);
+      }
+      if (items.length < 100) break;
+    } catch {
+      break;
+    }
+  }
+
+  return prsByDate;
 };
 
 // Per-day contribution calendar counts for the last year (public data).
@@ -140,16 +199,29 @@ const fetchCalendarCounts = async (username) => {
 };
 
 // ─── Upsert ──────────────────────────────────────────────────────────────────
-const buildOps = (username, detailsByDate, calendarByDate) => {
+const buildOps = (
+  username,
+  detailsByDate,
+  calendarByDate,
+  prHistoryByDate,
+  oldestEventDate,
+) => {
   const lower = username.toLowerCase();
-  const dates = new Set([...detailsByDate.keys(), ...calendarByDate.keys()]);
+  const dates = new Set([
+    ...detailsByDate.keys(),
+    ...calendarByDate.keys(),
+    ...prHistoryByDate.keys(),
+  ]);
   const now = new Date();
   const ops = [];
 
   for (const date of dates) {
     const detail = detailsByDate.get(date) || {};
     const commits = detail.commits || 0;
-    const pullRequests = detail.pullRequests || 0;
+    const pullRequests = Math.max(
+      detail.pullRequests || 0,
+      prHistoryByDate.get(date) || 0,
+    );
     const calendarCount = calendarByDate.get(date) || 0;
     if (commits === 0 && pullRequests === 0 && calendarCount === 0) continue;
 
@@ -161,6 +233,23 @@ const buildOps = (username, detailsByDate, calendarByDate) => {
           $max: { commits, pullRequests, calendarCount },
           $set: { updatedAt: now },
           $setOnInsert: { username: lower, date },
+        },
+        upsert: true,
+      },
+    });
+  }
+
+  // Meta doc: the earliest date the events API was ever observed to cover
+  // for this user. The backend scores days before this boundary with the
+  // calendar+PR hybrid formula instead of expecting event detail.
+  if (oldestEventDate) {
+    ops.push({
+      updateOne: {
+        filter: { username: lower, date: "meta" },
+        update: {
+          $min: { eventCoverageSince: oldestEventDate },
+          $set: { updatedAt: now },
+          $setOnInsert: { username: lower, date: "meta" },
         },
         upsert: true,
       },
@@ -194,12 +283,20 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
 
     for (const username of usernames) {
       try {
-        const [detailsByDate, calendarByDate] = await Promise.all([
-          fetchEventDetails(username),
-          fetchCalendarCounts(username),
-        ]);
+        const [eventResult, calendarByDate, prHistoryByDate] =
+          await Promise.all([
+            fetchEventDetails(username),
+            fetchCalendarCounts(username),
+            fetchPullRequestHistory(username),
+          ]);
 
-        const ops = buildOps(username, detailsByDate, calendarByDate);
+        const ops = buildOps(
+          username,
+          eventResult.detailsByDate,
+          calendarByDate,
+          prHistoryByDate,
+          eventResult.oldestEventDate,
+        );
         if (ops.length > 0) {
           const result = await statsCollection.bulkWrite(ops, {
             ordered: false,
