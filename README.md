@@ -5,19 +5,34 @@ Standalone worker that snapshots every member's GitHub activity into the
 API expires it** (~90 days / max 300 events per user). Without this ledger,
 commit/PR quantum points silently decay over time.
 
-The backend (Vercel) never writes this collection — it only reads it and
-merges it with live GitHub data in `GET /api/github/contributions/:username`.
+**This worker is no longer the only writer.** The backend runs the same
+algorithm in `backend/utils/githubSweep.js` — a lazy per-user refresh when a
+dashboard/profile is loaded, plus a daily `GET /api/cron/github-sweep` that
+works through the stalest members. That exists because a worker on a machine
+that stops is silent: every tile freezes at the last sweep and anyone who links
+GitHub afterwards reads 0 indefinitely.
+
+Running this worker as well is still useful (it sweeps everyone on a fixed
+cadence without touching request latency). Both writers use idempotent upserts
+keyed on `{username, date}` and stamp `lastSweepAt` on each member's meta doc,
+which the other throttles against, so they can run side by side. **Any change
+to the sweep algorithm must be made in both places.**
 
 ## What a sweep does
 
 1. Collects GitHub usernames from `quantum_logics.users`,
    `quantum_logics.employees`, and `ranking.teamState`
    (captains + members).
-2. For each username (sequentially, 1.5 s apart):
-   - public events API → per-day `commits` / `pullRequests`
+2. For each username (sequentially, 2.5 s apart — the search API allows 30/min):
+   - PR search API → per-day `pullRequests`, exact, full year
+   - public events API → per-day `commits` (and PRs only as a fallback: the
+     event stream has one entry per PR *action*, so counting them all inflates
+     the total)
    - jogruber contribution calendar → per-day `calendarCount`
-3. Upserts one document per `(username, date)` using `$max`, so stored
-   values **never decrease** when events expire upstream.
+3. Upserts one document per `(username, date)`. `commits` and `calendarCount`
+   use `$max`, so they **never decrease** when events expire upstream.
+   `pullRequests` is overwritten from the search history whenever that history
+   came back complete — otherwise an over-count could never be corrected.
 
 The first sweep doubles as the backfill: it stores a full year of
 `calendarCount`, which the backend scores ×1 for days older than the events

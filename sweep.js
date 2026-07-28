@@ -80,8 +80,16 @@ const githubHeaders = () => {
 };
 
 // ─── GitHub fetchers ─────────────────────────────────────────────────────────
-// Per-day commit/PR detail from the public events API (~90 days / 300 events).
-// Same logic as fetchPublicEventDetails in backend/routes/github.js.
+// Per-day commit detail from the public events API (~90 days / 300 events).
+//
+// NOTE: this file mirrors backend/utils/githubSweep.js, which the backend runs
+// itself (lazy per-user refresh + the scheduled slice). Keep the two in sync —
+// they write the same collection.
+//
+// PRs are counted here only as a fallback for when the search below fails: the
+// event stream carries one PullRequestEvent per *action* (opened, closed,
+// merged, reopened…), so counting them all inflates a member's PR total —
+// 15 events for 10 real PRs was typical. Only "opened" maps 1:1 to a PR.
 const fetchEventDetails = async (username) => {
   const headers = githubHeaders();
 
@@ -115,7 +123,10 @@ const fetchEventDetails = async (username) => {
         if (event.type === "PushEvent") {
           detail.commits += event.payload?.commits?.length || 1;
         }
-        if (event.type === "PullRequestEvent") {
+        if (
+          event.type === "PullRequestEvent" &&
+          event.payload?.action === "opened"
+        ) {
           detail.pullRequests += 1;
         }
         detailsByDate.set(date, detail);
@@ -127,14 +138,17 @@ const fetchEventDetails = async (username) => {
 };
 
 // Full-year PR history via the search API — unlike the events API this has
-// no ~90-day retention limit, so old PRs keep their ×5 points.
-const fetchPullRequestHistory = async (username) => {
+// no ~90-day retention limit, so old PRs keep their ×5 points. It also counts
+// each PR exactly once, on the day it was created, so when it completes
+// cleanly it is authoritative and overwrites stored counts (see buildOps).
+//
+// `complete` is false whenever a page errored, was rate limited, or the result
+// was truncated at the page cap — then the data is only a lower bound.
+const fetchPullRequestHistory = async (username, fromKey) => {
   const prsByDate = new Map();
-  const from = new Date();
-  from.setUTCDate(from.getUTCDate() - 364);
-  const fromKey = from.toISOString().slice(0, 10);
   const query = `type:pr author:${username} created:>=${fromKey}`;
   let retried = false;
+  let complete = false;
 
   for (let page = 1; page <= PR_SEARCH_MAX_PAGES; page++) {
     let res;
@@ -165,13 +179,20 @@ const fetchPullRequestHistory = async (username) => {
         const date = pr.created_at?.slice(0, 10);
         if (date) prsByDate.set(date, (prsByDate.get(date) || 0) + 1);
       }
-      if (items.length < 100) break;
+      if (items.length < 100) {
+        complete = true;
+        break;
+      }
+      if (page === PR_SEARCH_MAX_PAGES) {
+        // Only trustworthy if the cap happened to be the exact total.
+        complete = (Number(json?.total_count) || 0) <= PR_SEARCH_MAX_PAGES * 100;
+      }
     } catch {
       break;
     }
   }
 
-  return prsByDate;
+  return { prsByDate, complete };
 };
 
 // Per-day contribution calendar counts for the last year (public data).
@@ -204,7 +225,9 @@ const buildOps = (
   detailsByDate,
   calendarByDate,
   prHistoryByDate,
+  prsAuthoritative,
   oldestEventDate,
+  fromKey,
 ) => {
   const lower = username.toLowerCase();
   const dates = new Set([
@@ -218,22 +241,29 @@ const buildOps = (
   for (const date of dates) {
     const detail = detailsByDate.get(date) || {};
     const commits = detail.commits || 0;
-    const pullRequests = Math.max(
-      detail.pullRequests || 0,
-      prHistoryByDate.get(date) || 0,
-    );
+    // The search only covers the window it was asked for; older days keep
+    // whatever was recorded while they were still inside a search window.
+    const authoritative = prsAuthoritative && date >= fromKey;
+    const searchPrs = prHistoryByDate.get(date) || 0;
+    const pullRequests = authoritative
+      ? searchPrs
+      : Math.max(detail.pullRequests || 0, searchPrs);
     const calendarCount = calendarByDate.get(date) || 0;
     if (commits === 0 && pullRequests === 0 && calendarCount === 0) continue;
+
+    // $max: expiring events can never reduce what was already recorded. PRs
+    // are the exception when authoritative — they get $set so an over-count
+    // from the old event-based logic is corrected rather than frozen in place.
+    // (A field must appear in only one operator, never both.)
+    const $max = { commits, calendarCount };
+    const $set = { updatedAt: now };
+    if (authoritative) $set.pullRequests = pullRequests;
+    else $max.pullRequests = pullRequests;
 
     ops.push({
       updateOne: {
         filter: { username: lower, date },
-        // $max: expiring events can never reduce what was already recorded.
-        update: {
-          $max: { commits, pullRequests, calendarCount },
-          $set: { updatedAt: now },
-          $setOnInsert: { username: lower, date },
-        },
+        update: { $max, $set, $setOnInsert: { username: lower, date } },
         upsert: true,
       },
     });
@@ -242,19 +272,20 @@ const buildOps = (
   // Meta doc: the earliest date the events API was ever observed to cover
   // for this user. The backend scores days before this boundary with the
   // calendar+PR hybrid formula instead of expecting event detail.
-  if (oldestEventDate) {
-    ops.push({
-      updateOne: {
-        filter: { username: lower, date: "meta" },
-        update: {
-          $min: { eventCoverageSince: oldestEventDate },
-          $set: { updatedAt: now },
-          $setOnInsert: { username: lower, date: "meta" },
-        },
-        upsert: true,
-      },
-    });
-  }
+  // `lastSweepAt` is the claim the backend's own sweeps throttle against, so
+  // whichever writer runs, the other one stands down for a while.
+  const metaUpdate = {
+    $set: { updatedAt: now, lastSweepAt: now },
+    $setOnInsert: { username: lower, date: "meta" },
+  };
+  if (oldestEventDate) metaUpdate.$min = { eventCoverageSince: oldestEventDate };
+  ops.push({
+    updateOne: {
+      filter: { username: lower, date: "meta" },
+      update: metaUpdate,
+      upsert: true,
+    },
+  });
 
   return ops;
 };
@@ -281,21 +312,27 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
     let written = 0;
     let failed = 0;
 
+    const from = new Date();
+    from.setUTCDate(from.getUTCDate() - 364);
+    const fromKey = from.toISOString().slice(0, 10);
+    const toKey = new Date().toISOString().slice(0, 10);
+
     for (const username of usernames) {
       try {
-        const [eventResult, calendarByDate, prHistoryByDate] =
-          await Promise.all([
-            fetchEventDetails(username),
-            fetchCalendarCounts(username),
-            fetchPullRequestHistory(username),
-          ]);
+        const [eventResult, calendarByDate, prHistory] = await Promise.all([
+          fetchEventDetails(username),
+          fetchCalendarCounts(username),
+          fetchPullRequestHistory(username, fromKey),
+        ]);
 
         const ops = buildOps(
           username,
           eventResult.detailsByDate,
           calendarByDate,
-          prHistoryByDate,
+          prHistory.prsByDate,
+          prHistory.complete,
           eventResult.oldestEventDate,
+          fromKey,
         );
         if (ops.length > 0) {
           const result = await statsCollection.bulkWrite(ops, {
@@ -303,7 +340,31 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
           });
           written += result.upsertedCount + result.modifiedCount;
         }
-        console.log(`[sweep] ${username}: ${ops.length} day(s) upserted`);
+
+        // Days that used to hold a PR count but have none in the authoritative
+        // history (pure event-inflation) are not in `ops` at all, so clear them
+        // explicitly — otherwise the old value would survive forever.
+        let repaired = 0;
+        if (prHistory.complete) {
+          const cleared = await statsCollection.updateMany(
+            {
+              username: username.toLowerCase(),
+              date: {
+                $gte: fromKey,
+                $lte: toKey,
+                $nin: [...prHistory.prsByDate.keys()],
+              },
+              pullRequests: { $gt: 0 },
+            },
+            { $set: { pullRequests: 0, updatedAt: new Date() } },
+          );
+          repaired = cleared.modifiedCount || 0;
+        }
+
+        console.log(
+          `[sweep] ${username}: ${ops.length - 1} day(s) upserted` +
+            (repaired ? `, ${repaired} inflated PR day(s) cleared` : ""),
+        );
       } catch (err) {
         failed += 1;
         console.warn(`[sweep] ${username} failed: ${err.message}`);
