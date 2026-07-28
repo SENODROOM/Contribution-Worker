@@ -195,6 +195,85 @@ const fetchPullRequestHistory = async (username, fromKey) => {
   return { prsByDate, complete };
 };
 
+// ─── Per-day commits (GraphQL) ───────────────────────────────────────────────
+// The events API is capped at ~300 events, which for a prolific member is a
+// few percent of a year: one account's 7506 commits showed up there as 460.
+// GraphQL reports exact per-day commit counts for the whole year instead.
+//
+// Asked in four ~91-day windows because `contributions(first: 100)` is per
+// repository — over a full year a busy repo blows past 100 contribution days
+// and silently truncates, while inside a quarter it cannot. `maxRepositories:
+// 100` still caps very broad members, so this raises `commits`, never lowers.
+const COMMIT_WINDOW_COUNT = 4;
+const COMMIT_WINDOW_DAYS = 91;
+
+const COMMIT_QUERY = `query($login:String!,$from:DateTime!,$to:DateTime!){
+  user(login:$login){
+    contributionsCollection(from:$from,to:$to){
+      commitContributionsByRepository(maxRepositories:100){
+        contributions(first:100){
+          nodes{ occurredAt commitCount }
+        }
+      }
+    }
+  }
+}`;
+
+const fetchCommitContributions = async (username) => {
+  const commitsByDate = new Map();
+  if (!process.env.GITHUB_TOKEN) return commitsByDate;
+
+  const now = new Date();
+  const windows = [];
+  for (let i = COMMIT_WINDOW_COUNT - 1; i >= 0; i--) {
+    const to = new Date(now);
+    to.setUTCDate(now.getUTCDate() - i * COMMIT_WINDOW_DAYS);
+    const from = new Date(to);
+    from.setUTCDate(to.getUTCDate() - (COMMIT_WINDOW_DAYS - 1));
+    windows.push({ from: from.toISOString(), to: to.toISOString() });
+  }
+
+  const results = await Promise.allSettled(
+    windows.map((window) =>
+      fetch("https://api.github.com/graphql", {
+        method: "POST",
+        headers: {
+          Authorization: `bearer ${process.env.GITHUB_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: COMMIT_QUERY,
+          variables: { login: username, ...window },
+        }),
+        signal: AbortSignal.timeout(15000),
+      })
+    )
+  );
+
+  for (const result of results) {
+    if (result.status !== "fulfilled" || !result.value.ok) continue;
+    try {
+      const json = await result.value.json();
+      const repos =
+        json?.data?.user?.contributionsCollection?.commitContributionsByRepository;
+      if (!Array.isArray(repos)) continue;
+
+      for (const repo of repos) {
+        for (const node of repo?.contributions?.nodes || []) {
+          const date = node.occurredAt?.slice(0, 10);
+          if (!date) continue;
+          commitsByDate.set(
+            date,
+            (commitsByDate.get(date) || 0) + (node.commitCount || 0)
+          );
+        }
+      }
+    } catch {}
+  }
+
+  return commitsByDate;
+};
+
 // Per-day contribution calendar counts for the last year (public data).
 const fetchCalendarCounts = async (username) => {
   const countsByDate = new Map();
@@ -225,6 +304,7 @@ const buildOps = (
   detailsByDate,
   calendarByDate,
   prHistoryByDate,
+  commitsByDate,
   prsAuthoritative,
   oldestEventDate,
   fromKey,
@@ -234,13 +314,16 @@ const buildOps = (
     ...detailsByDate.keys(),
     ...calendarByDate.keys(),
     ...prHistoryByDate.keys(),
+    ...commitsByDate.keys(),
   ]);
   const now = new Date();
   const ops = [];
 
   for (const date of dates) {
     const detail = detailsByDate.get(date) || {};
-    const commits = detail.commits || 0;
+    // GraphQL is the accurate source; events only ever fill gaps it can't see
+    // (repos past the maxRepositories cap, or no token configured).
+    const commits = Math.max(detail.commits || 0, commitsByDate.get(date) || 0);
     // The search only covers the window it was asked for; older days keep
     // whatever was recorded while they were still inside a search window.
     const authoritative = prsAuthoritative && date >= fromKey;
@@ -290,8 +373,199 @@ const buildOps = (
   return ops;
 };
 
-const runSweep = async ({ quantumUri, rankingUri }) => {
-  const startedAt = Date.now();
+// ─── Fast pass: recent activity for everyone ─────────────────────────────────
+// The full sweep below costs ~9 requests per member and is bounded by the
+// search API's 30/min, so it can only run daily. That is far too slow for
+// "I pushed a commit, why is my dashboard not moving".
+//
+// GraphQL aliases fix it: one request carries the last few days for ~35
+// members and costs a single rate-limit point, so the whole community fits in
+// ~10 requests (5000/hour available) and can run every couple of minutes.
+// Recent days are the only ones that can change — history is already in the
+// ledger — so this is the only thing that has to run often.
+const RECENT_WINDOW_DAYS = 3;
+const RECENT_BATCH_SIZE = 35;
+const RECENT_BATCH_CONCURRENCY = 7;
+
+// Heartbeat doc. The backend reads this to tell whether this worker is alive;
+// without it, a stopped worker silently freezes every number in the portal —
+// which is exactly what happened between 2026-06-09 and 2026-06-28.
+const HEARTBEAT_KEY = "__worker__";
+
+const recentFragment = (alias, login) => `
+  ${alias}: user(login: "${login}") {
+    contributionsCollection(from: $from, to: $to) {
+      commitContributionsByRepository(maxRepositories: 25) {
+        contributions(first: 5) { nodes { occurredAt commitCount } }
+      }
+      pullRequestContributions(first: 25) {
+        nodes { pullRequest { createdAt } }
+      }
+    }
+  }`;
+
+const fetchRecentBatch = async (handles, { from, to }) => {
+  const results = new Map();
+  // Handles are interpolated into the query, so they must be exactly what
+  // GitHub allows in a login. getGithubUsername already guarantees it; this is
+  // the second lock on it.
+  const safe = handles.filter((h) => /^[a-zA-Z0-9-]+$/.test(h));
+  if (safe.length === 0) return results;
+
+  const query = `query($from:DateTime!,$to:DateTime!){${safe
+    .map((handle, index) => recentFragment(`u${index}`, handle))
+    .join("\n")}\n}`;
+
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `bearer ${process.env.GITHUB_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables: { from, to } }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`GitHub GraphQL returned ${res.status}`);
+
+  const json = await res.json();
+  safe.forEach((handle, index) => {
+    // A bad login nulls its own alias and reports an error while every other
+    // alias still resolves, so partial data is normal here.
+    const cc = json?.data?.[`u${index}`]?.contributionsCollection;
+    if (!cc) return;
+
+    const commitsByDate = new Map();
+    for (const repo of cc.commitContributionsByRepository || []) {
+      for (const node of repo?.contributions?.nodes || []) {
+        const date = node.occurredAt?.slice(0, 10);
+        if (!date) continue;
+        commitsByDate.set(
+          date,
+          (commitsByDate.get(date) || 0) + (node.commitCount || 0)
+        );
+      }
+    }
+
+    const prsByDate = new Map();
+    for (const node of cc.pullRequestContributions?.nodes || []) {
+      const date = node?.pullRequest?.createdAt?.slice(0, 10);
+      if (date) prsByDate.set(date, (prsByDate.get(date) || 0) + 1);
+    }
+
+    results.set(handle.toLowerCase(), { commitsByDate, prsByDate });
+  });
+
+  return results;
+};
+
+const buildRecentOps = (byHandle) => {
+  const now = new Date();
+  const ops = [];
+
+  for (const [handle, { commitsByDate, prsByDate }] of byHandle) {
+    for (const date of new Set([...commitsByDate.keys(), ...prsByDate.keys()])) {
+      const commits = commitsByDate.get(date) || 0;
+      const pullRequests = prsByDate.get(date) || 0;
+      if (commits === 0 && pullRequests === 0) continue;
+
+      ops.push({
+        updateOne: {
+          filter: { username: handle, date },
+          // Deliberately no `$set: { updatedAt }`: this runs every couple of
+          // minutes, and touching a field every pass would make every write
+          // count as a modification. A pure $max update means modifiedCount is
+          // exactly "someone's numbers went up".
+          update: {
+            $max: { commits, pullRequests },
+            $setOnInsert: { username: handle, date, updatedAt: now },
+          },
+          upsert: true,
+        },
+      });
+    }
+  }
+
+  return ops;
+};
+
+const writeHeartbeat = async (statsCollection, extra = {}) => {
+  const now = new Date();
+  await statsCollection.updateOne(
+    { username: HEARTBEAT_KEY, date: "meta" },
+    {
+      $set: { updatedAt: now, lastRecentAt: now, ...extra },
+      $setOnInsert: { username: HEARTBEAT_KEY, date: "meta" },
+    },
+    { upsert: true }
+  );
+};
+
+/**
+ * Refresh the last few days for every member. One pass ≈ 10 GraphQL requests
+ * and ~12s for ~350 members.
+ *
+ * @returns {Promise<{ members: number, days: number, changed: number }>}
+ */
+const runRecentSweep = async ({ quantumConn, rankingConn }) => {
+  const statsCollection = rankingConn.collection("githubContributionStats");
+  const handles = await enumerateUsernames({ quantumConn, rankingConn });
+  if (handles.length === 0 || !process.env.GITHUB_TOKEN) {
+    return { members: 0, days: 0, changed: 0 };
+  }
+
+  const to = new Date();
+  const from = new Date(to);
+  from.setUTCDate(to.getUTCDate() - RECENT_WINDOW_DAYS);
+  const window = { from: from.toISOString(), to: to.toISOString() };
+
+  const batches = [];
+  for (let i = 0; i < handles.length; i += RECENT_BATCH_SIZE) {
+    batches.push(handles.slice(i, i + RECENT_BATCH_SIZE));
+  }
+
+  const byHandle = new Map();
+  const errors = [];
+  for (let i = 0; i < batches.length; i += RECENT_BATCH_CONCURRENCY) {
+    const settled = await Promise.allSettled(
+      batches
+        .slice(i, i + RECENT_BATCH_CONCURRENCY)
+        .map((batch) => fetchRecentBatch(batch, window))
+    );
+    for (const result of settled) {
+      // Never swallow these. A pass that quietly returns nothing looks exactly
+      // like a pass where nobody committed, which is how a broken pipeline goes
+      // unnoticed for weeks.
+      if (result.status !== "fulfilled") {
+        errors.push(result.reason?.message || String(result.reason));
+        continue;
+      }
+      for (const [handle, data] of result.value) byHandle.set(handle, data);
+    }
+  }
+
+  if (errors.length > 0) {
+    console.warn(
+      `[recent] ${errors.length}/${batches.length} batch(es) failed: ${errors[0]}`
+    );
+  }
+
+  const ops = buildRecentOps(byHandle);
+  let changed = 0;
+  if (ops.length > 0) {
+    const result = await statsCollection.bulkWrite(ops, { ordered: false });
+    changed = (result.upsertedCount || 0) + (result.modifiedCount || 0);
+  }
+
+  await writeHeartbeat(statsCollection, { recentMembers: byHandle.size });
+  return { members: byHandle.size, days: ops.length, changed };
+};
+
+/**
+ * Open both connections once. The recent sweep runs every couple of minutes,
+ * so it must not pay for a fresh connection handshake each time — the caller
+ * opens these at startup and hands them to every pass.
+ */
+const openConnections = async ({ quantumUri, rankingUri }) => {
   const quantumConn = await mongoose
     .createConnection(quantumUri, { bufferCommands: false })
     .asPromise();
@@ -299,12 +573,23 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
     .createConnection(rankingUri, { bufferCommands: false })
     .asPromise();
 
-  try {
+  await rankingConn
+    .collection("githubContributionStats")
+    .createIndex({ username: 1, date: 1 }, { unique: true });
+
+  return {
+    quantumConn,
+    rankingConn,
+    close: () =>
+      Promise.allSettled([quantumConn.close(), rankingConn.close()]),
+  };
+};
+
+const runSweep = async ({ quantumConn, rankingConn }) => {
+  const startedAt = Date.now();
+
+  {
     const statsCollection = rankingConn.collection("githubContributionStats");
-    await statsCollection.createIndex(
-      { username: 1, date: 1 },
-      { unique: true }
-    );
 
     const usernames = await enumerateUsernames({ quantumConn, rankingConn });
     console.log(`[sweep] ${usernames.length} GitHub username(s) found`);
@@ -319,17 +604,20 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
 
     for (const username of usernames) {
       try {
-        const [eventResult, calendarByDate, prHistory] = await Promise.all([
-          fetchEventDetails(username),
-          fetchCalendarCounts(username),
-          fetchPullRequestHistory(username, fromKey),
-        ]);
+        const [eventResult, calendarByDate, prHistory, commitsByDate] =
+          await Promise.all([
+            fetchEventDetails(username),
+            fetchCalendarCounts(username),
+            fetchPullRequestHistory(username, fromKey),
+            fetchCommitContributions(username),
+          ]);
 
         const ops = buildOps(
           username,
           eventResult.detailsByDate,
           calendarByDate,
           prHistory.prsByDate,
+          commitsByDate,
           prHistory.complete,
           eventResult.oldestEventDate,
           fromKey,
@@ -373,13 +661,24 @@ const runSweep = async ({ quantumUri, rankingUri }) => {
       await sleep(DELAY_BETWEEN_USERS_MS);
     }
 
+    await writeHeartbeat(statsCollection, {
+      lastFullAt: new Date(),
+      fullMembers: usernames.length,
+    });
+
     console.log(
       `[sweep] done in ${Math.round((Date.now() - startedAt) / 1000)}s — ` +
         `${usernames.length} user(s), ${written} write(s), ${failed} failure(s)`
     );
-  } finally {
-    await Promise.allSettled([quantumConn.close(), rankingConn.close()]);
+
+    return { members: usernames.length, written, failed };
   }
 };
 
-module.exports = { runSweep, getGithubUsername };
+module.exports = {
+  openConnections,
+  runSweep,
+  runRecentSweep,
+  getGithubUsername,
+  HEARTBEAT_KEY,
+};
