@@ -1,3 +1,17 @@
+// Force known-good DNS servers before anything else runs. Node's bundled
+// resolver (c-ares) auto-detects the system's DNS servers separately from
+// Windows' own resolver, and on this machine it was picking up `127.0.0.1`
+// (nothing listens there — likely a stale leftover from a VPN or local DNS
+// proxy that used to bind that address) while `nslookup` correctly used the
+// real router (192.168.100.1) and worked fine. That mismatch was the actual
+// cause of the mongodb+srv:// "querySrv ECONNREFUSED" crash loop that took
+// this worker down for ~3 days (2026-07-28 to 2026-07-31) — not an IPv6
+// preference issue, not a MongoDB Atlas problem, not a code bug. Confirmed
+// directly: `require('dns').getServers()` printed `['127.0.0.1']` here.
+// Bypassing whatever is misdetecting the system resolver, rather than
+// depending on it, is more robust than chasing the OS-level root cause.
+require("dns").setServers(["1.1.1.1", "1.0.0.1", "8.8.8.8"]);
+
 require("dotenv").config();
 const { openConnections, runSweep, runRecentSweep } = require("./sweep");
 
