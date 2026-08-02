@@ -14,22 +14,28 @@ require("dns").setServers(["1.1.1.1", "1.0.0.1", "8.8.8.8"]);
 
 require("dotenv").config();
 const { openConnections, runSweep, runRecentSweep } = require("./sweep");
+const { runPolycodeSweep } = require("./polycode");
 
-// This worker owns every recurring GitHub call for the portal. The backend is
-// deployed on Vercel and only reads what lands here — it makes no GitHub
-// requests of its own — so if this process stops, every commit/PR number in
-// the portal freezes at the moment it died. Watch it (`pm2 status`, and the
-// heartbeat this writes into the ledger's __worker__ meta doc).
+// This worker owns every recurring GitHub and PolyCode call for the portal. The
+// backend is deployed on Vercel and only reads what lands here — it makes no
+// requests to either of its own — so if this process stops, every commit/PR and
+// XP number in the portal freezes at the moment it died. Watch it (`pm2
+// status`, and the heartbeats this writes into each ledger's __worker__ meta
+// doc).
 //
-// Two passes on very different cadences:
+// Three passes on very different cadences:
 //
-//   recent — every RECENT_INTERVAL_MINUTES (default 2). Batched GraphQL, ~10
-//            requests for the whole community, so a push shows up in the
-//            portal within a couple of minutes.
-//   full   — every SWEEP_INTERVAL_HOURS (default 24). ~9 requests per member
-//            and bounded by the search API's 30/min, so it can only run daily.
-//            Owns exact PR history, the contribution calendar, and repair of
-//            days the fast pass can't correct.
+//   recent   — every RECENT_INTERVAL_MINUTES (default 2). Batched GraphQL, ~10
+//              requests for the whole community, so a push shows up in the
+//              portal within a couple of minutes.
+//   full     — every SWEEP_INTERVAL_HOURS (default 24). ~9 requests per member
+//              and bounded by the search API's 30/min, so it can only run
+//              daily. Owns exact PR history, the contribution calendar, and
+//              repair of days the fast pass can't correct.
+//   polycode — every POLYCODE_INTERVAL_MINUTES (default 15). One request per
+//              member with a linked account (~12), each returning a full year.
+//              Slower than `recent` on purpose: it points at a third-party
+//              deployment, and XP does not need two-minute freshness.
 
 const quantumUri = process.env.MONGO_URI_QUANTUM;
 const rankingUri = process.env.MONGO_RANKING_URI;
@@ -54,12 +60,16 @@ const fullIntervalMs =
   (Number(process.env.SWEEP_INTERVAL_HOURS) || 24) * 60 * 60 * 1000;
 const recentIntervalMs =
   (Number(process.env.RECENT_INTERVAL_MINUTES) || 2) * 60 * 1000;
+const polycodeIntervalMs =
+  (Number(process.env.POLYCODE_INTERVAL_MINUTES) || 15) * 60 * 1000;
 const runOnce = process.argv.includes("--once");
 const recentOnly = process.argv.includes("--recent");
+const polycodeOnly = process.argv.includes("--polycode");
 
 let connections = null;
 let fullRunning = false;
 let recentRunning = false;
+let polycodeRunning = false;
 
 const runFull = async () => {
   // Skip rather than queue: a full pass takes ~30 minutes, and stacking them
@@ -101,6 +111,26 @@ const runRecent = async () => {
   }
 };
 
+const runPolycode = async () => {
+  // Independent of the GitHub passes — different upstream, no shared rate
+  // limit — so it only guards against overlapping itself.
+  if (polycodeRunning) return;
+  polycodeRunning = true;
+  try {
+    const result = await runPolycodeSweep(connections);
+    if (result.changed > 0 || result.failed > 0) {
+      console.log(
+        `[polycode] ${result.changed} day(s) updated across ${result.members} member(s)` +
+          (result.failed ? `, ${result.failed} failed` : "")
+      );
+    }
+  } catch (err) {
+    console.error("[worker] polycode sweep failed:", err.message);
+  } finally {
+    polycodeRunning = false;
+  }
+};
+
 const shutdown = async (signal) => {
   console.log(`[worker] ${signal} received, closing connections`);
   if (connections) await connections.close();
@@ -119,7 +149,15 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (polycodeOnly) {
+    const result = await runPolycodeSweep(connections);
+    console.log(`[polycode] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (runOnce) {
+    await runPolycode();
     await runFull();
     await connections.close();
     process.exit(0);
@@ -131,6 +169,14 @@ const shutdown = async (signal) => {
   setInterval(runRecent, recentIntervalMs);
   console.log(
     `[worker] recent sweep every ${recentIntervalMs / 60000}min`
+  );
+
+  // Before the full pass: it is a dozen requests and finishes in seconds,
+  // whereas the full GitHub pass takes ~30 minutes.
+  await runPolycode();
+  setInterval(runPolycode, polycodeIntervalMs);
+  console.log(
+    `[worker] polycode sweep every ${polycodeIntervalMs / 60000}min`
   );
 
   await runFull();

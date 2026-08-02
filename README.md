@@ -2,35 +2,47 @@
 
 Standalone worker that snapshots every member's GitHub activity into the
 `ranking.githubContributionStats` collection **before GitHub's public events
-API expires it** (~90 days / max 300 events per user). Without this ledger,
-commit/PR quantum points silently decay over time.
+API expires it** (~90 days / max 300 events per user), and their PolyCode XP
+into `ranking.polycodeStats`. Without these ledgers, commit/PR quantum points
+silently decay over time and PolyCode points cannot be scored on public pages
+at all.
 
-**This worker owns every recurring GitHub call for the portal.** The backend
-is on Vercel — billed per invocation, and able to freeze post-response work —
-so it makes no GitHub requests at all; it reads this ledger and serves it.
+**This worker owns every recurring GitHub and PolyCode call for the portal.**
+The backend is on Vercel — billed per invocation, and able to freeze
+post-response work — so it makes no requests to either at all; it reads these
+ledgers and serves them. For PolyCode there is a second reason: it is a
+third-party app (Team Mercury's), and the pages needing its numbers (`/explore`,
+public profiles) are unauthenticated, so fetching on a request path would let
+anonymous traffic drive requests at someone else's deployment.
 
-**If this process stops, every commit/PR number in the portal freezes at that
-moment, and nobody is told.** That happened between 2026-06-09 and 2026-06-28
-and went unnoticed for 19 days. Two guards now exist, but neither replaces
-watching the process:
+**If this process stops, every commit/PR and XP number in the portal freezes at
+that moment, and nobody is told.** That happened between 2026-06-09 and
+2026-06-28 and went unnoticed for 19 days. Two guards now exist, but neither
+replaces watching the process:
 
-- each pass stamps a heartbeat on the ledger's `__worker__` meta doc, and
-  `GET /api/stats/live` reports it as `github: { updatedAt, stale }`
-- `backend/utils/githubSweep.js` mirrors this algorithm for manual failover
-  (`/api/cron/github-recent`, `/api/cron/github-sweep`, and
-  `backend/scripts/sweepGithubLedger.js`) — nothing schedules it
+- each pass stamps a heartbeat on its ledger's `__worker__` meta doc, and
+  `GET /api/stats/live` reports the GitHub one as `github: { updatedAt, stale }`
+- `backend/utils/githubSweep.js` and `backend/utils/polycodeSweep.js` mirror
+  these algorithms for manual failover (`/api/cron/github-recent`,
+  `/api/cron/github-sweep`, `/api/cron/polycode`, and
+  `backend/scripts/sweepGithubLedger.js`) — nothing schedules them
 
-**Any change to the sweep algorithm must be made in both places.**
+**Any change to a sweep algorithm must be made in both places.**
 
-## Two passes
+## Three passes
 
 | Pass | Every | Covers |
 | --- | --- | --- |
 | recent (`RECENT_INTERVAL_MINUTES`, default 2) | ~12s, ~10 GraphQL requests | last 3 days, so a push reaches the portal within minutes |
 | full (`SWEEP_INTERVAL_HOURS`, default 24) | ~30 min | the whole year — exact PR history, calendar, repair |
+| polycode (`POLYCODE_INTERVAL_MINUTES`, default 15) | ~5s, one request per linked member (~12) | the whole year of XP, plus the chart's overview/streak snapshot |
 
 The recent pass is affordable because GraphQL aliases carry ~35 members per
 request for a single rate-limit point (5000/hour available).
+
+The PolyCode pass is slower than `recent` on purpose: each response already
+carries a full year, and the upstream is someone else's deployment, so there is
+nothing to gain from hammering it.
 
 ## What a sweep does
 
@@ -54,12 +66,41 @@ The first sweep doubles as the backfill: it stores a full year of
 `calendarCount`, which the backend scores ×1 for days older than the events
 window that have no commit/PR detail.
 
+## What the PolyCode pass does
+
+1. Collects distinct `polycoder` handles from `quantum_logics.users`.
+2. `GET <POLYCODE_API_URL>/api/auth/polycoder/:handle/progress` per handle,
+   400 ms apart. A 404 is normal attrition (deleted/renamed account) and leaves
+   the stored rows alone, so historical points never vanish.
+3. Upserts one document per `(polycoder, date)` with `$max` on `xp` — a
+   truncated response must not lower a day already earned — plus a
+   `date: "meta"` snapshot doc holding the chart's overview and streak fields.
+
+Only the fields `PolyCodeChart` renders are stored. The upstream payload also
+carries a member's id, real name, last login and course list; the endpoint that
+replays this (`/api/polycode/progress/:polycoder`) is public, so the snapshot is
+a whitelist rather than the raw objects.
+
+`5 XP = 1 quantum point`, floored **per day** — matching
+`backend/utils/polycodeProgress.js polycodeXpToPoints`. Summing XP across days
+before flooring would inflate totals.
+
 ## Run
 
 ```bash
 npm install
 cp .env.example .env   # fill in the URIs
 ```
+
+`.env`:
+
+| Var | Required | Notes |
+| --- | --- | --- |
+| `MONGO_URI_QUANTUM` | yes | member list (`users`, `employees`) |
+| `MONGO_RANKING_URI` | yes | both ledgers are written here |
+| `GITHUB_TOKEN` | yes | classic PAT — see the note under Deploy |
+| `POLYCODE_API_URL` | no | PolyCode **backend**, defaults to `https://poly-code-backend.vercel.app`. `code.quantumlogicslimited.com` is the frontend and answers every path with HTML — the pass detects that and errors rather than storing junk. |
+| `RECENT_INTERVAL_MINUTES` / `SWEEP_INTERVAL_HOURS` / `POLYCODE_INTERVAL_MINUTES` | no | pass cadences (2 / 24 / 15) |
 
 ### With pm2 (recommended)
 
@@ -82,9 +123,10 @@ npx pm2 save           # remember the current process list
 ### Without pm2
 
 ```bash
-npm start              # both passes on their intervals
+npm start              # all three passes on their intervals
 npm run recent         # one recent pass, then exit (fast — good for verifying)
-npm run sweep          # one-off sweep, then exit (for external cron)
+npm run polycode       # one PolyCode pass, then exit (~5s)
+npm run sweep          # one-off full sweep (+ PolyCode), then exit (for external cron)
 ```
 
 ## Deploy

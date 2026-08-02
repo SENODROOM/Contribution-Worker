@@ -577,6 +577,11 @@ const openConnections = async ({ quantumUri, rankingUri }) => {
     .collection("githubContributionStats")
     .createIndex({ username: 1, date: 1 }, { unique: true });
 
+  // The PolyCode pass (polycode.js) writes through the same connections.
+  await rankingConn
+    .collection("polycodeStats")
+    .createIndex({ polycoder: 1, date: 1 }, { unique: true });
+
   return {
     quantumConn,
     rankingConn,
