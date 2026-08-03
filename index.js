@@ -152,7 +152,7 @@ const runAchievers = async (options = {}) => {
   if (achieverRunning) return;
   achieverRunning = true;
   try {
-    const result = await runAchieverFinalize(achieverState, options);
+    const result = await runAchieverFinalize(connections, achieverState, options);
     if (result.ran && result.decided?.length) {
       for (const entry of result.decided) {
         console.log(
