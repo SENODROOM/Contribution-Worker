@@ -26,6 +26,8 @@ replaces watching the process:
   these algorithms for manual failover (`/api/cron/github-recent`,
   `/api/cron/github-sweep`, `/api/cron/polycode`, and
   `backend/scripts/sweepGithubLedger.js`) — nothing schedules them
+- the daily achiever decision (below) backfills any window it missed, so an
+  outage delays awards rather than losing them
 
 **Any change to a sweep algorithm must be made in both places.**
 
@@ -43,6 +45,38 @@ request for a single rate-limit point (5000/hour available).
 The PolyCode pass is slower than `recent` on purpose: each response already
 carries a full year, and the upstream is someone else's deployment, so there is
 nothing to gain from hammering it.
+
+## Plus one daily decision
+
+Once per Pakistan-time day, just after the cutover
+(`ACHIEVERS_FINALIZE_HOUR_PKT`, default `0` — midnight, when the day closes and
+every score resets), the finished day's winners are frozen into
+`ranking.achievers`. First place earns a **Daily Achiever** award on their
+profile; the Monday run does the same for the finished week (**Weekly
+Achiever**). Winning again raises the ×N multiplier rather than adding a badge.
+
+Freezing is the point: the GitHub full pass keeps repairing old days, so a
+podium recomputed next week can quietly crown someone else. Once decided, a
+window never changes.
+
+`achievers.js` does not compute the podium — it triggers
+`POST /api/cron/finalize-achievers`, which reuses the portal's own scorer. The
+score is five sources deep and joins members across Discord IDs, GitHub handles
+and PolyCode handles; a second copy of that here would drift, and the first
+symptom would be a frozen award contradicting the board that announced it. So
+this process owns *when*, the portal owns *what* — one authenticated request a
+day, no third-party calls.
+
+**This pass is optional.** Without `PORTAL_API_URL` and the secret it stands down
+silently and the portal decides on its own next Explore rebuild instead, so
+awards land whenever the first visitor arrives after midnight rather than exactly
+at it. Configure it when you want the timing exact; nothing is lost either way,
+since a decision is frozen once and never revisited.
+
+The finalize is idempotent and reaches back over recent windows, so a worker that
+was down for a week catches up on its next tick instead of losing those awards.
+Checked every `ACHIEVERS_CHECK_MINUTES` (default 10) so a restart near midnight
+still lands it.
 
 ## What a sweep does
 
@@ -100,7 +134,10 @@ cp .env.example .env   # fill in the URIs
 | `MONGO_RANKING_URI` | yes | both ledgers are written here |
 | `GITHUB_TOKEN` | yes | classic PAT — see the note under Deploy |
 | `POLYCODE_API_URL` | no | PolyCode **backend**, defaults to `https://poly-code-backend.vercel.app`. `code.quantumlogicslimited.com` is the frontend and answers every path with HTML — the pass detects that and errors rather than storing junk. |
+| `PORTAL_API_URL` | no | Origin of the portal **backend**, no trailing slash. Only needed to decide awards exactly at the cutover; unset, the portal decides them on its own rebuild. |
+| `JWT_SECRET` | with the above | The same value the backend uses — its `/api/cron/*` routes accept it as the bearer. Set `CRON_SECRET` instead only if that deployment defines one; it wins over `JWT_SECRET` on both sides. |
 | `RECENT_INTERVAL_MINUTES` / `SWEEP_INTERVAL_HOURS` / `POLYCODE_INTERVAL_MINUTES` | no | pass cadences (2 / 24 / 15) |
+| `ACHIEVERS_FINALIZE_HOUR_PKT` / `ACHIEVERS_CHECK_MINUTES` | no | when the day is decided, and how often that is checked (0 / 10) |
 
 ### With pm2 (recommended)
 
@@ -123,10 +160,11 @@ npx pm2 save           # remember the current process list
 ### Without pm2
 
 ```bash
-npm start              # all three passes on their intervals
+npm start              # all three passes + the daily decision, on their intervals
 npm run recent         # one recent pass, then exit (fast — good for verifying)
 npm run polycode       # one PolyCode pass, then exit (~5s)
-npm run sweep          # one-off full sweep (+ PolyCode), then exit (for external cron)
+npm run achievers      # force the achiever decision now, then exit
+npm run sweep          # one-off full sweep (+ PolyCode + decision), then exit
 ```
 
 ## Deploy

@@ -15,6 +15,7 @@ require("dns").setServers(["1.1.1.1", "1.0.0.1", "8.8.8.8"]);
 require("dotenv").config();
 const { openConnections, runSweep, runRecentSweep } = require("./sweep");
 const { runPolycodeSweep } = require("./polycode");
+const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 
 // This worker owns every recurring GitHub and PolyCode call for the portal. The
 // backend is deployed on Vercel and only reads what lands here — it makes no
@@ -36,6 +37,11 @@ const { runPolycodeSweep } = require("./polycode");
 //              member with a linked account (~12), each returning a full year.
 //              Slower than `recent` on purpose: it points at a third-party
 //              deployment, and XP does not need two-minute freshness.
+//
+// Plus one scheduled decision (achievers.js): once a day, just after the
+// Pakistan-time cutover, the finished day's winners are frozen into
+// ranking.achievers and can never change again. That is what the Daily/Weekly
+// Achiever awards on a member's profile are counted from.
 
 const quantumUri = process.env.MONGO_URI_QUANTUM;
 const rankingUri = process.env.MONGO_RANKING_URI;
@@ -62,14 +68,25 @@ const recentIntervalMs =
   (Number(process.env.RECENT_INTERVAL_MINUTES) || 2) * 60 * 1000;
 const polycodeIntervalMs =
   (Number(process.env.POLYCODE_INTERVAL_MINUTES) || 15) * 60 * 1000;
+// The achiever check is cheap (usually a single "nothing to do" request) so it
+// can tick often; what stops it repeating is the day it last settled, not the
+// interval. A short interval is what makes it survive a restart near midnight.
+const achieverIntervalMs =
+  (Number(process.env.ACHIEVERS_CHECK_MINUTES) || 10) * 60 * 1000;
 const runOnce = process.argv.includes("--once");
 const recentOnly = process.argv.includes("--recent");
 const polycodeOnly = process.argv.includes("--polycode");
+const achieversOnly = process.argv.includes("--achievers");
 
 let connections = null;
 let fullRunning = false;
 let recentRunning = false;
 let polycodeRunning = false;
+let achieverRunning = false;
+// Which PKT date the finalize has already been settled for. In memory only: the
+// endpoint is idempotent, so the worst a restart costs is one redundant request
+// that reports nothing to do.
+const achieverState = { lastFinalizedFor: "" };
 
 const runFull = async () => {
   // Skip rather than queue: a full pass takes ~30 minutes, and stacking them
@@ -131,6 +148,30 @@ const runPolycode = async () => {
   }
 };
 
+const runAchievers = async (options = {}) => {
+  if (achieverRunning) return;
+  achieverRunning = true;
+  try {
+    const result = await runAchieverFinalize(achieverState, options);
+    if (result.ran && result.decided?.length) {
+      for (const entry of result.decided) {
+        console.log(
+          `[achievers] ${entry.period} ${entry.periodKey} → ` +
+            `${entry.winner || "nobody scored"} (${entry.entrants} entrant(s))`
+        );
+      }
+    }
+    if (result.ran && result.failed) {
+      console.warn(`[achievers] ${result.failed} window(s) failed — will retry`);
+    }
+    return result;
+  } catch (err) {
+    console.error("[worker] achiever finalize failed:", err.message);
+  } finally {
+    achieverRunning = false;
+  }
+};
+
 const shutdown = async (signal) => {
   console.log(`[worker] ${signal} received, closing connections`);
   if (connections) await connections.close();
@@ -156,8 +197,17 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (achieversOnly) {
+    // force: a manual run is an explicit request to decide now, not a tick.
+    const result = await runAchievers({ force: true });
+    console.log(`[achievers] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (runOnce) {
     await runPolycode();
+    await runAchievers();
     await runFull();
     await connections.close();
     process.exit(0);
@@ -177,6 +227,18 @@ const shutdown = async (signal) => {
   setInterval(runPolycode, polycodeIntervalMs);
   console.log(
     `[worker] polycode sweep every ${polycodeIntervalMs / 60000}min`
+  );
+
+  // Optional: without PORTAL_API_URL this stands down and the portal decides on
+  // its own rebuild instead. Announce which of the two is in play, so a silent
+  // pass is never mistaken for a broken one.
+  const achieverProbe = await runAchievers();
+  setInterval(runAchievers, achieverIntervalMs);
+  console.log(
+    achieverProbe?.ran === false && achieverProbe.reason?.startsWith("not configured")
+      ? "[worker] achiever finalize not configured — the portal will decide on its own rebuild"
+      : `[worker] achiever finalize checked every ${achieverIntervalMs / 60000}min ` +
+          `(decides at ${String(FINALIZE_HOUR_PKT).padStart(2, "0")}:00 PKT)`
   );
 
   await runFull();
