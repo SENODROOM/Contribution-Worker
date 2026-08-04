@@ -16,6 +16,7 @@ require("dotenv").config();
 const { openConnections, runSweep, runRecentSweep } = require("./sweep");
 const { runPolycodeSweep } = require("./polycode");
 const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
+const { runLeaderboardRebuild } = require("./leaderboard");
 
 // This worker owns every recurring GitHub and PolyCode call for the portal. The
 // backend is deployed on Vercel and only reads what lands here — it makes no
@@ -42,6 +43,12 @@ const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 // Pakistan-time cutover, the finished day's winners are frozen into
 // ranking.achievers and can never change again. That is what the Daily/Weekly
 // Achiever awards on a member's profile are counted from.
+//
+// Plus one periodic cache refresh (leaderboard.js): every
+// LEADERBOARD_INTERVAL_MINUTES (default 10), the quantum-points leaderboard is
+// rebuilt and persisted to ranking.leaderboardSnapshot, so a cold serverless
+// request (a public profile view in particular) reads one indexed doc instead
+// of rebuilding the whole community's board inline.
 
 const quantumUri = process.env.MONGO_URI_QUANTUM;
 const rankingUri = process.env.MONGO_RANKING_URI;
@@ -73,16 +80,23 @@ const polycodeIntervalMs =
 // interval. A short interval is what makes it survive a restart near midnight.
 const achieverIntervalMs =
   (Number(process.env.ACHIEVERS_CHECK_MINUTES) || 10) * 60 * 1000;
+// Matches routes/rank.js's own 10-minute in-memory TTL — no point refreshing
+// the persisted snapshot more often than a warm container would rebuild it
+// itself.
+const leaderboardIntervalMs =
+  (Number(process.env.LEADERBOARD_INTERVAL_MINUTES) || 10) * 60 * 1000;
 const runOnce = process.argv.includes("--once");
 const recentOnly = process.argv.includes("--recent");
 const polycodeOnly = process.argv.includes("--polycode");
 const achieversOnly = process.argv.includes("--achievers");
+const leaderboardOnly = process.argv.includes("--leaderboard");
 
 let connections = null;
 let fullRunning = false;
 let recentRunning = false;
 let polycodeRunning = false;
 let achieverRunning = false;
+let leaderboardRunning = false;
 // Which PKT date the finalize has already been settled for. In memory only: the
 // endpoint is idempotent, so the worst a restart costs is one redundant request
 // that reports nothing to do.
@@ -172,6 +186,22 @@ const runAchievers = async (options = {}) => {
   }
 };
 
+const runLeaderboardSnapshot = async () => {
+  if (leaderboardRunning) return;
+  leaderboardRunning = true;
+  try {
+    const result = await runLeaderboardRebuild();
+    if (result.ran) {
+      console.log(`[leaderboard] snapshot refreshed — ${result.members} member(s)`);
+    }
+    return result;
+  } catch (err) {
+    console.error("[worker] leaderboard rebuild failed:", err.message);
+  } finally {
+    leaderboardRunning = false;
+  }
+};
+
 const shutdown = async (signal) => {
   console.log(`[worker] ${signal} received, closing connections`);
   if (connections) await connections.close();
@@ -205,9 +235,17 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (leaderboardOnly) {
+    const result = await runLeaderboardSnapshot();
+    console.log(`[leaderboard] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (runOnce) {
     await runPolycode();
     await runAchievers();
+    await runLeaderboardSnapshot();
     await runFull();
     await connections.close();
     process.exit(0);
@@ -239,6 +277,17 @@ const shutdown = async (signal) => {
       ? "[worker] achiever finalize not configured — the portal will decide on its own rebuild"
       : `[worker] achiever finalize checked every ${achieverIntervalMs / 60000}min ` +
           `(decides at ${String(FINALIZE_HOUR_PKT).padStart(2, "0")}:00 PKT)`
+  );
+
+  // Same optional wiring as achievers: without PORTAL_API_URL this stands
+  // down and the portal just rebuilds live on request when its own 10-minute
+  // in-memory cache goes cold, same as before this existed.
+  const leaderboardProbe = await runLeaderboardSnapshot();
+  setInterval(runLeaderboardSnapshot, leaderboardIntervalMs);
+  console.log(
+    leaderboardProbe?.ran === false && leaderboardProbe.reason?.startsWith("not configured")
+      ? "[worker] leaderboard snapshot not configured — cold requests will rebuild it live instead"
+      : `[worker] leaderboard snapshot refreshed every ${leaderboardIntervalMs / 60000}min`
   );
 
   await runFull();
