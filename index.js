@@ -69,6 +69,49 @@ if (!process.env.GITHUB_TOKEN) {
   );
 }
 
+// A token that is *set but rejected* (expired classic PAT, revoked, wrong
+// value) is the failure this worker is least able to survive on its own: every
+// GitHub fetch 401s, the recent pass retrieves nothing, and the process keeps
+// reporting "online". The heartbeat now records that (sweep.js), but a human
+// scanning `pm2 logs` should see it in one obvious line at startup rather than
+// inferring it from a wall of per-batch warnings. Probe once, non-fatal.
+const preflightGithubToken = async () => {
+  if (!process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch("https://api.github.com/rate_limit", {
+      headers: {
+        Authorization: `token ${process.env.GITHUB_TOKEN}`,
+        "User-Agent": "QuantumCommunity-ContributionWorker",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 401) {
+      console.error(
+        "\n" +
+          "************************************************************\n" +
+          "[worker] GITHUB_TOKEN is set but GitHub rejects it (401 Bad\n" +
+          "credentials) — it is EXPIRED or REVOKED. Every commit/PR\n" +
+          "number in the portal stays frozen until this is replaced.\n" +
+          "Fix: new classic PAT (scopes: repo, read:org) at\n" +
+          "https://github.com/settings/tokens -> put in .env ->\n" +
+          "`pm2 restart contribution-worker`.\n" +
+          "************************************************************\n"
+      );
+    } else if (!res.ok) {
+      console.warn(`[worker] GITHUB_TOKEN preflight: HTTP ${res.status}`);
+    } else {
+      const expiry = res.headers.get(
+        "github-authentication-token-expiration"
+      );
+      console.log(
+        `[worker] GITHUB_TOKEN accepted${expiry ? ` (expires ${expiry})` : ""}`
+      );
+    }
+  } catch (err) {
+    console.warn(`[worker] GITHUB_TOKEN preflight failed: ${err.message}`);
+  }
+};
+
 const fullIntervalMs =
   (Number(process.env.SWEEP_INTERVAL_HOURS) || 24) * 60 * 60 * 1000;
 const recentIntervalMs =
@@ -210,6 +253,8 @@ const shutdown = async (signal) => {
 
 (async () => {
   connections = await openConnections({ quantumUri, rankingUri });
+
+  await preflightGithubToken();
 
   if (recentOnly) {
     // A manual one-off always reports, even when nothing changed — otherwise

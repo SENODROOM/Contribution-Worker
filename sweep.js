@@ -387,9 +387,20 @@ const RECENT_WINDOW_DAYS = 3;
 const RECENT_BATCH_SIZE = 35;
 const RECENT_BATCH_CONCURRENCY = 7;
 
-// Heartbeat doc. The backend reads this to tell whether this worker is alive;
-// without it, a stopped worker silently freezes every number in the portal —
-// which is exactly what happened between 2026-06-09 and 2026-06-28.
+// Heartbeat doc. The backend reads this to tell whether this worker is alive
+// AND landing data — two different questions.
+//
+//   lastRecentAt    — a recent pass completed (process is alive), success or not
+//   lastRecentOkAt  — a recent pass completed AND retrieved data for >=1 member
+//   lastRecentError / lastRecentErrorAt — the last pass that got nothing, and why
+//
+// Without lastRecentOkAt a stopped worker silently froze every number in the
+// portal (2026-06-09 → 2026-06-28); with only lastRecentAt, a worker that was
+// still *running* but whose GITHUB_TOKEN had expired did the same thing — every
+// GraphQL call 401s, the pass retrieves nothing, yet the old heartbeat stamped
+// the same fresh timestamp a good pass did (2026-08-27 → 2026-08-30). The
+// backend's getLedgerFreshness() keys "stale" off lastRecentOkAt and raises
+// "broken" when lastRecentErrorAt is the newer of the two.
 const HEARTBEAT_KEY = "__worker__";
 
 const recentFragment = (alias, login) => `
@@ -488,12 +499,15 @@ const buildRecentOps = (byHandle) => {
   return ops;
 };
 
+// `extra` carries exactly the timestamps the caller means to write — this no
+// longer hardcodes `lastRecentAt`, because "a pass ran" and "a pass succeeded"
+// have to be recorded separately (see the HEARTBEAT_KEY note above).
 const writeHeartbeat = async (statsCollection, extra = {}) => {
   const now = new Date();
   await statsCollection.updateOne(
     { username: HEARTBEAT_KEY, date: "meta" },
     {
-      $set: { updatedAt: now, lastRecentAt: now, ...extra },
+      $set: { updatedAt: now, ...extra },
       $setOnInsert: { username: HEARTBEAT_KEY, date: "meta" },
     },
     { upsert: true }
@@ -556,8 +570,40 @@ const runRecentSweep = async ({ quantumConn, rankingConn }) => {
     changed = (result.upsertedCount || 0) + (result.modifiedCount || 0);
   }
 
-  await writeHeartbeat(statsCollection, { recentMembers: byHandle.size });
-  return { members: byHandle.size, days: ops.length, changed };
+  // A pass that retrieved nothing is not the same as a quiet pass. A valid
+  // login always resolves its alias — an empty contributionsCollection still
+  // lands in `byHandle` — so byHandle.size === 0 across a non-empty roster, or
+  // every batch throwing, means GitHub refused us wholesale (an expired
+  // GITHUB_TOKEN 401ing, a rate-limit lockout, GitHub down). Record that as an
+  // error instead of stamping the "healthy" heartbeat a good pass writes, or
+  // the portal reads as current while every commit/PR number silently freezes.
+  const now = new Date();
+  const everyBatchFailed = batches.length > 0 && errors.length === batches.length;
+  const retrievedNothing = handles.length > 0 && byHandle.size === 0;
+  const healthy = !everyBatchFailed && !retrievedNothing;
+
+  const heartbeat = { lastRecentAt: now, recentMembers: byHandle.size };
+  if (healthy) {
+    heartbeat.lastRecentOkAt = now;
+    heartbeat.lastRecentError = null;
+  } else {
+    heartbeat.lastRecentError =
+      errors[0] || "recent sweep retrieved no contribution data";
+    heartbeat.lastRecentErrorAt = now;
+    console.error(
+      `[recent] pass retrieved nothing — ${errors.length}/${batches.length} ` +
+        `batch(es) failed: ${heartbeat.lastRecentError}`
+    );
+  }
+  await writeHeartbeat(statsCollection, heartbeat);
+
+  return {
+    members: byHandle.size,
+    days: ops.length,
+    changed,
+    healthy,
+    error: healthy ? null : heartbeat.lastRecentError,
+  };
 };
 
 /**
@@ -666,10 +712,22 @@ const runSweep = async ({ quantumConn, rankingConn }) => {
       await sleep(DELAY_BETWEEN_USERS_MS);
     }
 
-    await writeHeartbeat(statsCollection, {
+    // Same alive-vs-succeeded split as the recent pass. `failed` only counts
+    // members whose fetch threw; a dead token mostly shows up as zero commit
+    // data rather than an exception, so this catches the catastrophic case
+    // (DNS, every request timing out) — the recent pass carries the token
+    // signal.
+    const fullHeartbeat = {
       lastFullAt: new Date(),
       fullMembers: usernames.length,
-    });
+    };
+    if (failed < usernames.length) {
+      fullHeartbeat.lastFullOkAt = new Date();
+    } else {
+      fullHeartbeat.lastFullError = `full sweep: all ${failed} member(s) failed`;
+      fullHeartbeat.lastFullErrorAt = new Date();
+    }
+    await writeHeartbeat(statsCollection, fullHeartbeat);
 
     console.log(
       `[sweep] done in ${Math.round((Date.now() - startedAt) / 1000)}s — ` +
