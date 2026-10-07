@@ -12,10 +12,23 @@ function getSmtpConfig() {
   };
 }
 
-async function sendEmail({ to, subject, text, html }) {
+// Whether a send can even be attempted. The mailer asks before it claims
+// anything, so mail queued while SMTP is unset waits instead of burning its
+// attempts on a configuration that cannot work.
+function isSmtpConfigured() {
   const config = getSmtpConfig();
+  return Boolean(config.host && config.user && config.pass);
+}
 
-  if (!config.host || !config.user || !config.pass || !config.from) {
+// `from` overrides SMTP_FROM for mail that has to come from a specific address
+// (member notifications are sent as admin@). The SMTP account still
+// authenticates as SMTP_USER, so that mailbox must be allowed to send as the
+// overridden address or the provider rejects the message.
+async function sendEmail({ to, subject, text, html, from }) {
+  const config = getSmtpConfig();
+  const fromAddress = from || config.from;
+
+  if (!config.host || !config.user || !config.pass || !fromAddress) {
     console.warn("[email] SMTP is not configured. Email not sent.");
     console.warn(`[email] To: ${to}`);
     console.warn(`[email] Subject: ${subject}`);
@@ -30,8 +43,8 @@ async function sendEmail({ to, subject, text, html }) {
     auth: { user: config.user, pass: config.pass },
   });
 
-  await transporter.sendMail({ from: config.from, to, subject, text, html });
+  await transporter.sendMail({ from: fromAddress, to, subject, text, html });
   return { sent: true };
 }
 
-module.exports = { sendEmail };
+module.exports = { sendEmail, isSmtpConfigured };

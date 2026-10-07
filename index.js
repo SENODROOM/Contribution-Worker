@@ -18,6 +18,7 @@ const { runPolycodeSweep } = require("./polycode");
 const { runDlsSweep } = require("./dls");
 const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 const { runLeaderboardRebuild } = require("./leaderboard");
+const { runMailer } = require("./mailer");
 
 // This worker owns every recurring GitHub and PolyCode call for the portal. The
 // backend is deployed on Vercel and only reads what lands here — it makes no
@@ -53,6 +54,12 @@ const { runLeaderboardRebuild } = require("./leaderboard");
 // rebuilt and persisted to ranking.leaderboardSnapshot, so a cold serverless
 // request (a public profile view in particular) reads one indexed doc instead
 // of rebuilding the whole community's board inline.
+//
+// Plus mail delivery (mailer.js): every MAILER_INTERVAL_MINUTES (default 1) the
+// emails the backend has queued for members in ranking.emailOutbox — role
+// alerts, promotions and removals, medal congratulations — are sent from
+// admin@. The backend only queues; if this process stops, no member is mailed
+// until it is back, and anything that went stale in the meantime is dropped.
 
 const quantumUri = process.env.MONGO_URI_QUANTUM;
 const rankingUri = process.env.MONGO_RANKING_URI;
@@ -136,12 +143,17 @@ const achieverIntervalMs =
 // itself.
 const leaderboardIntervalMs =
   (Number(process.env.LEADERBOARD_INTERVAL_MINUTES) || 10) * 60 * 1000;
+// An empty queue costs one indexed lookup, so this can tick every minute — and
+// a member told "you are no longer Project Captain" should not hear it late.
+const mailerIntervalMs =
+  (Number(process.env.MAILER_INTERVAL_MINUTES) || 1) * 60 * 1000;
 const runOnce = process.argv.includes("--once");
 const recentOnly = process.argv.includes("--recent");
 const polycodeOnly = process.argv.includes("--polycode");
 const dlsOnly = process.argv.includes("--dls");
 const achieversOnly = process.argv.includes("--achievers");
 const leaderboardOnly = process.argv.includes("--leaderboard");
+const mailerOnly = process.argv.includes("--mailer");
 
 let connections = null;
 let fullRunning = false;
@@ -150,6 +162,10 @@ let polycodeRunning = false;
 let dlsRunning = false;
 let achieverRunning = false;
 let leaderboardRunning = false;
+let mailerRunning = false;
+// The last SMTP-level failure reported and when, so an outage that fails every
+// one-minute tick the same way is a line every half hour, not 1,440 a day.
+const mailerFault = { message: "", at: 0 };
 // Which PKT date the finalize has already been settled for. In memory only: the
 // endpoint is idempotent, so the worst a restart costs is one redundant request
 // that reports nothing to do.
@@ -276,6 +292,43 @@ const runLeaderboardSnapshot = async () => {
   }
 };
 
+const runMail = async () => {
+  // Its own upstream (the SMTP server) and its own collection; a tick that
+  // finds the last one still sending just waits for the next.
+  if (mailerRunning) return;
+  mailerRunning = true;
+  try {
+    const result = await runMailer(connections);
+    if (result.ran && (result.sent > 0 || result.skipped > 0 || result.failed > 0)) {
+      console.log(
+        `[mailer] ${result.sent} sent` +
+          (result.skipped ? `, ${result.skipped} skipped` : "") +
+          (result.failed ? `, ${result.failed} failed` : "")
+      );
+    }
+    if (result.transportError) {
+      const repeat =
+        result.transportError === mailerFault.message &&
+        Date.now() - mailerFault.at < 30 * 60 * 1000;
+      if (!repeat) {
+        mailerFault.message = result.transportError;
+        mailerFault.at = Date.now();
+        console.error(
+          `[mailer] cannot reach or sign in to the SMTP server — member emails are ` +
+            `queuing, none are being sent: ${result.transportError}`
+        );
+      }
+    } else if (result.ran) {
+      mailerFault.message = "";
+    }
+    return result;
+  } catch (err) {
+    console.error("[worker] mailer failed:", err.message);
+  } finally {
+    mailerRunning = false;
+  }
+};
+
 const shutdown = async (signal) => {
   console.log(`[worker] ${signal} received, closing connections`);
   if (connections) await connections.close();
@@ -325,6 +378,13 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (mailerOnly) {
+    const result = await runMailer(connections);
+    console.log(`[mailer] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (runOnce) {
     await runPolycode();
     await runDls();
@@ -341,6 +401,17 @@ const shutdown = async (signal) => {
   setInterval(runRecent, recentIntervalMs);
   console.log(
     `[worker] recent sweep every ${recentIntervalMs / 60000}min`
+  );
+
+  // Early, so a restart drains whatever queued while the worker was down
+  // before the slower passes start. Without SMTP_* it stands down and the
+  // queue waits; announced either way.
+  const mailerProbe = await runMail();
+  setInterval(runMail, mailerIntervalMs);
+  console.log(
+    mailerProbe?.ran === false
+      ? "[worker] mailer not configured — set SMTP_HOST, SMTP_USER and SMTP_PASS to send member emails"
+      : `[worker] member emails sent every ${mailerIntervalMs / 60000}min`
   );
 
   // Before the full pass: it is a dozen requests and finishes in seconds,
