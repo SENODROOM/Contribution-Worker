@@ -633,6 +633,17 @@ const openConnections = async ({ quantumUri, rankingUri }) => {
     .collection("dlsStats")
     .createIndex({ userId: 1, date: 1 }, { unique: true });
 
+  // The member-email queue (mailer.js). The backend's model declares these same
+  // two indexes; the unique one is what makes a notification queued twice a
+  // single email, so it is ensured here too rather than left to whichever
+  // process happens to touch the collection first.
+  await rankingConn
+    .collection("emailOutbox")
+    .createIndex({ dedupeKey: 1 }, { unique: true });
+  await rankingConn
+    .collection("emailOutbox")
+    .createIndex({ status: 1, nextAttemptAt: 1 });
+
   return {
     quantumConn,
     rankingConn,
