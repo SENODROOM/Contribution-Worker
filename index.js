@@ -15,6 +15,7 @@ require("dns").setServers(["1.1.1.1", "1.0.0.1", "8.8.8.8"]);
 require("dotenv").config();
 const { openConnections, runSweep, runRecentSweep } = require("./sweep");
 const { runPolycodeSweep } = require("./polycode");
+const { runDlsSweep } = require("./dls");
 const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 const { runLeaderboardRebuild } = require("./leaderboard");
 
@@ -38,6 +39,9 @@ const { runLeaderboardRebuild } = require("./leaderboard");
 //              member with a linked account (~12), each returning a full year.
 //              Slower than `recent` on purpose: it points at a third-party
 //              deployment, and XP does not need two-minute freshness.
+//   dls      — every DLS_INTERVAL_MINUTES (default 5). Digital Logics Studio XP
+//              for every member, a handful of batched requests to our own DLS
+//              backend. Optional: stands down without DLS_SYNC_SECRET.
 //
 // Plus one scheduled decision (achievers.js): once a day, just after the
 // Pakistan-time cutover, the finished day's winners are frozen into
@@ -118,6 +122,10 @@ const recentIntervalMs =
   (Number(process.env.RECENT_INTERVAL_MINUTES) || 2) * 60 * 1000;
 const polycodeIntervalMs =
   (Number(process.env.POLYCODE_INTERVAL_MINUTES) || 15) * 60 * 1000;
+// Faster than PolyCode: the upstream is our own deployment, and a member who
+// just solved a problem expects to see it on today's board.
+const dlsIntervalMs =
+  (Number(process.env.DLS_INTERVAL_MINUTES) || 5) * 60 * 1000;
 // The achiever check is cheap (usually a single "nothing to do" request) so it
 // can tick often; what stops it repeating is the day it last settled, not the
 // interval. A short interval is what makes it survive a restart near midnight.
@@ -131,6 +139,7 @@ const leaderboardIntervalMs =
 const runOnce = process.argv.includes("--once");
 const recentOnly = process.argv.includes("--recent");
 const polycodeOnly = process.argv.includes("--polycode");
+const dlsOnly = process.argv.includes("--dls");
 const achieversOnly = process.argv.includes("--achievers");
 const leaderboardOnly = process.argv.includes("--leaderboard");
 
@@ -138,6 +147,7 @@ let connections = null;
 let fullRunning = false;
 let recentRunning = false;
 let polycodeRunning = false;
+let dlsRunning = false;
 let achieverRunning = false;
 let leaderboardRunning = false;
 // Which PKT date the finalize has already been settled for. In memory only: the
@@ -202,6 +212,27 @@ const runPolycode = async () => {
     console.error("[worker] polycode sweep failed:", err.message);
   } finally {
     polycodeRunning = false;
+  }
+};
+
+const runDls = async () => {
+  // Its own upstream and its own collection, so like PolyCode it only guards
+  // against overlapping itself.
+  if (dlsRunning) return;
+  dlsRunning = true;
+  try {
+    const result = await runDlsSweep(connections);
+    if (result.ran && (result.changed > 0 || result.failed > 0)) {
+      console.log(
+        `[dls] ${result.changed} row(s) updated across ${result.accounts} account(s)` +
+          (result.failed ? `, ${result.failed} batch(es) failed` : "")
+      );
+    }
+    return result;
+  } catch (err) {
+    console.error("[worker] dls sweep failed:", err.message);
+  } finally {
+    dlsRunning = false;
   }
 };
 
@@ -272,6 +303,13 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (dlsOnly) {
+    const result = await runDlsSweep(connections);
+    console.log(`[dls] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (achieversOnly) {
     // force: a manual run is an explicit request to decide now, not a tick.
     const result = await runAchievers({ force: true });
@@ -289,6 +327,7 @@ const shutdown = async (signal) => {
 
   if (runOnce) {
     await runPolycode();
+    await runDls();
     await runAchievers();
     await runLeaderboardSnapshot();
     await runFull();
@@ -310,6 +349,17 @@ const shutdown = async (signal) => {
   setInterval(runPolycode, polycodeIntervalMs);
   console.log(
     `[worker] polycode sweep every ${polycodeIntervalMs / 60000}min`
+  );
+
+  // Optional: without DLS_SYNC_SECRET this stands down and Digital Logics
+  // Studio XP scores nothing. Announced either way, so a silent pass is never
+  // mistaken for a broken one.
+  const dlsProbe = await runDls();
+  setInterval(runDls, dlsIntervalMs);
+  console.log(
+    dlsProbe?.ran === false
+      ? "[worker] dls sweep not configured — set DLS_SYNC_SECRET to score Digital Logics Studio XP"
+      : `[worker] dls sweep every ${dlsIntervalMs / 60000}min`
   );
 
   // Optional: without PORTAL_API_URL this stands down and the portal decides on

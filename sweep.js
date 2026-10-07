@@ -628,6 +628,11 @@ const openConnections = async ({ quantumUri, rankingUri }) => {
     .collection("polycodeStats")
     .createIndex({ polycoder: 1, date: 1 }, { unique: true });
 
+  // And the Digital Logics Studio pass (dls.js).
+  await rankingConn
+    .collection("dlsStats")
+    .createIndex({ userId: 1, date: 1 }, { unique: true });
+
   return {
     quantumConn,
     rankingConn,

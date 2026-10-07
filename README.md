@@ -31,13 +31,14 @@ replaces watching the process:
 
 **Any change to a sweep algorithm must be made in both places.**
 
-## Three passes
+## Four passes
 
 | Pass | Every | Covers |
 | --- | --- | --- |
 | recent (`RECENT_INTERVAL_MINUTES`, default 2) | ~12s, ~10 GraphQL requests | last 3 days, so a push reaches the portal within minutes |
 | full (`SWEEP_INTERVAL_HOURS`, default 24) | ~30 min | the whole year — exact PR history, calendar, repair |
 | polycode (`POLYCODE_INTERVAL_MINUTES`, default 15) | ~5s, one request per linked member (~12) | the whole year of XP, plus the chart's overview/streak snapshot |
+| dls (`DLS_INTERVAL_MINUTES`, default 5) | one request per 50 members | the whole year of Digital Logics Studio XP — optional, off until `DLS_SYNC_SECRET` is set |
 
 The recent pass is affordable because GraphQL aliases carry ~35 members per
 request for a single rate-limit point (5000/hour available).
@@ -119,6 +120,26 @@ a whitelist rather than the raw objects.
 `backend/utils/polycodeProgress.js polycodeXpToPoints`. Summing XP across days
 before flooring would inflate totals.
 
+## What the Digital Logics Studio pass does
+
+Optional — it stands down until `DLS_SYNC_SECRET` is set.
+
+1. Collects the email of every member the portal can vouch for
+   (`isEmailVerified` or `isVerified`) from `quantum_logics.users`.
+2. `POST <DLS_API_URL>/api/community/xp` in batches of 50 emails, with the
+   shared secret as a bearer and `tzOffsetMinutes: 300`, so days come back cut
+   on Pakistan time. Emails with no DLS account are simply absent from the
+   response.
+3. Upserts one document per `(userId, date)` into `ranking.dlsStats` with `$max`
+   on `xp`, plus a `date: "meta"` doc per matched account. Rows are keyed on
+   `users._id` — no email address is written to the ranking DB.
+
+`5 XP = 1 quantum point`, floored per day and capped at 100 a day — scored by
+`backend/utils/dlsPoints.js`, not here. A wrong or missing secret fails the
+whole pass loudly and leaves the heartbeat untouched, so a broken pass never
+looks fresh. `node backend/scripts/checkDlsLedger.js` (from the backend) shows
+whether rows are landing.
+
 ## Run
 
 ```bash
@@ -136,7 +157,9 @@ cp .env.example .env   # fill in the URIs
 | `POLYCODE_API_URL` | no | PolyCode **backend**, defaults to `https://poly-code-backend.vercel.app`. `code.quantumlogicslimited.com` is the frontend and answers every path with HTML — the pass detects that and errors rather than storing junk. |
 | `PORTAL_API_URL` | no | Origin of the portal **backend**, no trailing slash. Only needed to decide awards exactly at the cutover; unset, the portal decides them on its own rebuild. |
 | `JWT_SECRET` | with the above | The same value the backend uses — its `/api/cron/*` routes accept it as the bearer. Set `CRON_SECRET` instead only if that deployment defines one; it wins over `JWT_SECRET` on both sides. |
-| `RECENT_INTERVAL_MINUTES` / `SWEEP_INTERVAL_HOURS` / `POLYCODE_INTERVAL_MINUTES` | no | pass cadences (2 / 24 / 15) |
+| `DLS_SYNC_SECRET` | no | Turns the Digital Logics Studio pass on. Must equal `COMMUNITY_SYNC_SECRET` on the DLS **backend**. |
+| `DLS_API_URL` | no | DLS **backend**, defaults to `https://digital-logics-studio-backend.vercel.app` |
+| `RECENT_INTERVAL_MINUTES` / `SWEEP_INTERVAL_HOURS` / `POLYCODE_INTERVAL_MINUTES` / `DLS_INTERVAL_MINUTES` | no | pass cadences (2 / 24 / 15 / 5) |
 | `ACHIEVERS_FINALIZE_HOUR_PKT` / `ACHIEVERS_CHECK_MINUTES` | no | when the day is decided, and how often that is checked (0 / 10) |
 
 ### With pm2 (recommended)
@@ -163,6 +186,7 @@ npx pm2 save           # remember the current process list
 npm start              # all three passes + the daily decision, on their intervals
 npm run recent         # one recent pass, then exit (fast — good for verifying)
 npm run polycode       # one PolyCode pass, then exit (~5s)
+npm run dls            # one Digital Logics Studio pass, then exit
 npm run achievers      # force the achiever decision now, then exit
 npm run sweep          # one-off full sweep (+ PolyCode + decision), then exit
 ```
