@@ -140,6 +140,33 @@ whole pass loudly and leaves the heartbeat untouched, so a broken pass never
 looks fresh. `node backend/scripts/checkDlsLedger.js` (from the backend) shows
 whether rows are landing.
 
+## What the mailer does
+
+Sends every email the portal owes a member, from
+`admin@quantumlogicslimited.com`. The backend never sends one itself — it queues
+them in `ranking.emailOutbox`, already written, and `mailer.js` delivers what is
+due every `MAILER_INTERVAL_MINUTES` (default 1):
+
+- **role alerts** — once a week, each Team Captain, Project Captain or Commander
+  failing a rule that keeps their seat ("you uploaded 1 of the 3 required
+  streams last week");
+- **role and team changes** — promoted, deposed, replaced, moved, removed,
+  banned, unbanned, retired, or an appeal rejected, as it happens;
+- **medals** — "you won the Daily Achiever medal", for all six window medals,
+  when the day or week is decided.
+
+For each mail it claims the row, reads the member's current address from
+`quantum_logics.users` (the outbox holds a user id, never an email), sends, and
+records `sent`, `skipped` (expired, or no usable address) or `failed` with the
+reason. A message the server refuses is retried with a growing delay for about
+three hours; a failure to reach or sign in to the SMTP server stops the pass
+without counting against any mail, and is logged once per half hour.
+
+Needs only the `SMTP_*` vars. Without them it stands down and the queue waits —
+but a mail still unsent when it goes stale (a few days) is dropped rather than
+delivered late. `node backend/scripts/checkEmailOutbox.js` (from the backend)
+shows what is queued, sent and stuck.
+
 ## Run
 
 ```bash
@@ -161,6 +188,8 @@ cp .env.example .env   # fill in the URIs
 | `DLS_API_URL` | no | DLS **backend**, defaults to `https://digital-logics-studio-backend.vercel.app` |
 | `RECENT_INTERVAL_MINUTES` / `SWEEP_INTERVAL_HOURS` / `POLYCODE_INTERVAL_MINUTES` / `DLS_INTERVAL_MINUTES` | no | pass cadences (2 / 24 / 15 / 5) |
 | `ACHIEVERS_FINALIZE_HOUR_PKT` / `ACHIEVERS_CHECK_MINUTES` | no | when the day is decided, and how often that is checked (0 / 10) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` | for email | The `admin@quantumlogicslimited.com` mailbox. Member emails are always sent *from* that address, so `SMTP_USER` must be it (or be allowed to send as it). Unset, no member is emailed. |
+| `MAILER_INTERVAL_MINUTES` | no | how often the outbox is drained (1) |
 
 ### With pm2 (recommended)
 
@@ -188,6 +217,7 @@ npm run recent         # one recent pass, then exit (fast — good for verifying
 npm run polycode       # one PolyCode pass, then exit (~5s)
 npm run dls            # one Digital Logics Studio pass, then exit
 npm run achievers      # force the achiever decision now, then exit
+npm run mailer         # send whatever is due in the email outbox, then exit
 npm run sweep          # one-off full sweep (+ PolyCode + decision), then exit
 ```
 
