@@ -162,6 +162,16 @@ reason. A message the server refuses is retried with a growing delay for about
 three hours; a failure to reach or sign in to the SMTP server stops the pass
 without counting against any mail, and is logged once per half hour.
 
+**After every `git pull` on the host, run `npm install` before restarting.**
+This pass is the one that needs `nodemailer`; a folder that has the code but
+not the package cannot send, and for two days that is exactly what production
+was. The worker now checks for it up front, logs `[mailer] NOT SENDING — …` at
+start and every half hour while it lasts, and records the reason in its
+heartbeat row (`__worker__` in the outbox), which is the first line
+`checkEmailOutbox.js` prints. A fault like that — or the SMTP server being
+unreachable, or refusing the sign-in — costs no mail an attempt; only the
+server refusing a particular message does.
+
 Needs only the `SMTP_*` vars. Without them it stands down and the queue waits —
 but a mail still unsent when it goes stale (a few days) is dropped rather than
 delivered late. `node backend/scripts/checkEmailOutbox.js` (from the backend)

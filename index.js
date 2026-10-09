@@ -306,19 +306,23 @@ const runMail = async () => {
           (result.failed ? `, ${result.failed} failed` : "")
       );
     }
-    if (result.transportError) {
+    // Either way of not sending: the pass stood down (no SMTP settings, or the
+    // mail library missing from this install), or it ran and could not reach
+    // or sign in to the server. Both leave mail queuing, so both are said out
+    // loud — and again every half hour for as long as it lasts.
+    const fault = result.transportError || (result.ran ? "" : result.reason);
+    if (fault) {
       const repeat =
-        result.transportError === mailerFault.message &&
+        fault === mailerFault.message &&
         Date.now() - mailerFault.at < 30 * 60 * 1000;
       if (!repeat) {
-        mailerFault.message = result.transportError;
+        mailerFault.message = fault;
         mailerFault.at = Date.now();
         console.error(
-          `[mailer] cannot reach or sign in to the SMTP server — member emails are ` +
-            `queuing, none are being sent: ${result.transportError}`
+          `[mailer] NOT SENDING — member emails are queuing, none are going out: ${fault}`
         );
       }
-    } else if (result.ran) {
+    } else {
       mailerFault.message = "";
     }
     return result;
@@ -404,15 +408,14 @@ const shutdown = async (signal) => {
   );
 
   // Early, so a restart drains whatever queued while the worker was down
-  // before the slower passes start. Without SMTP_* it stands down and the
-  // queue waits; announced either way.
+  // before the slower passes start. When it cannot send (no SMTP_*, or
+  // nodemailer missing from this install) it stands down and the queue waits;
+  // runMail has already said why, so this only confirms the working case.
   const mailerProbe = await runMail();
   setInterval(runMail, mailerIntervalMs);
-  console.log(
-    mailerProbe?.ran === false
-      ? "[worker] mailer not configured — set SMTP_HOST, SMTP_USER and SMTP_PASS to send member emails"
-      : `[worker] member emails sent every ${mailerIntervalMs / 60000}min`
-  );
+  if (mailerProbe?.ran !== false) {
+    console.log(`[worker] member emails sent every ${mailerIntervalMs / 60000}min`);
+  }
 
   // Before the full pass: it is a dozen requests and finishes in seconds,
   // whereas the full GitHub pass takes ~30 minutes.

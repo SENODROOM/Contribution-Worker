@@ -20,6 +20,26 @@ function isSmtpConfigured() {
   return Boolean(config.host && config.user && config.pass);
 }
 
+// Why no mail can be sent from this install right now, or "" when one can.
+//
+// The second check is the one that was missing: for two days the production
+// worker had the SMTP vars and the new code but had never had `npm install` run
+// after the pull, so every send died on `Cannot find module 'nodemailer'` — and
+// since that looked like the server refusing each message, 25 mails burned all
+// their attempts and were written off. A dependency missing from the folder is
+// a fault of the install, never of a message, so it is asked about up front.
+function mailUnavailableReason() {
+  if (!isSmtpConfigured()) {
+    return "SMTP is not configured — set SMTP_HOST, SMTP_USER and SMTP_PASS in .env";
+  }
+  try {
+    require.resolve("nodemailer");
+  } catch {
+    return "nodemailer is not installed — run `npm install` in the worker folder, then restart";
+  }
+  return "";
+}
+
 // `from` overrides SMTP_FROM for mail that has to come from a specific address
 // (member notifications are sent as admin@). The SMTP account still
 // authenticates as SMTP_USER, so that mailbox must be allowed to send as the
@@ -47,4 +67,4 @@ async function sendEmail({ to, subject, text, html, from }) {
   return { sent: true };
 }
 
-module.exports = { sendEmail, isSmtpConfigured };
+module.exports = { sendEmail, isSmtpConfigured, mailUnavailableReason };

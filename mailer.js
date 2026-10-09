@@ -22,9 +22,15 @@
 // Needs the SMTP_* vars (see email.js) and nothing else. Without them the pass
 // stands down and the queue simply waits; a mail still unsent when its
 // `expiresAt` passes is dropped rather than delivered late.
-const { sendEmail, isSmtpConfigured } = require("./email");
+const { sendEmail, mailUnavailableReason } = require("./email");
 
 const OUTBOX = "emailOutbox";
+// This pass's own row in the outbox: when it last ran and whether it could
+// send. Never a mail (status "done"). It is what lets
+// backend/scripts/checkEmailOutbox.js, run from anywhere, say "the worker
+// cannot send, and here is why" instead of leaving a silent queue to be
+// puzzled over — the same job the __worker__ doc does on each ledger.
+const HEARTBEAT_KEY = "__worker__";
 
 // Every member notification comes from this address, by name. The SMTP account
 // (SMTP_USER) has to be this mailbox or be allowed to send as it.
@@ -55,8 +61,39 @@ const TRANSPORT_ERROR_CODES = new Set([
   "ETIMEDOUT",
   "ETLS",
 ]);
+// The SMTP server's own verdict on one mail: a refused recipient, refused content.
+const MESSAGE_ERROR_CODES = new Set(["EENVELOPE", "EMESSAGE"]);
+
+// An error counts against a mail only when it is recognisably about that mail —
+// the server answered and refused it. Everything else is treated as a fault of
+// this install or its connection: it would hit every mail in the queue the same
+// way, so charging each one an attempt just empties the queue into "failed".
+// The list above used to be the whole test, and a missing dependency
+// (MODULE_NOT_FOUND) fell through it as a per-message failure — see email.js.
+const isAboutThisMessage = (err) => {
+  if (TRANSPORT_ERROR_CODES.has(err?.code)) return false;
+  if (MESSAGE_ERROR_CODES.has(err?.code)) return true;
+  return Number(err?.responseCode) >= 400;
+};
 
 const isValidEmail = (value) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(value || "").trim());
+
+// Best-effort: the heartbeat describes the pass, it must never fail it.
+const stampHeartbeat = async (outbox, summary, fault = "") => {
+  const now = new Date();
+  try {
+    await outbox.updateOne(
+      { dedupeKey: HEARTBEAT_KEY },
+      {
+        $set: { subject: summary, lastError: fault, updatedAt: now },
+        $setOnInsert: { kind: "heartbeat", status: "done", createdAt: now },
+      },
+      { upsert: true },
+    );
+  } catch (err) {
+    console.warn(`[mailer] heartbeat not written: ${err.message}`);
+  }
+};
 
 /**
  * Deliver what is due in the outbox.
@@ -65,11 +102,16 @@ const isValidEmail = (value) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(value |
  * @returns {Promise<{ ran: boolean, reason?: string, sent?: number, skipped?: number, failed?: number, transportError?: string }>}
  */
 const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT } = {}) => {
-  if (!isSmtpConfigured()) {
-    return { ran: false, reason: "not configured (SMTP_HOST + SMTP_USER + SMTP_PASS)" };
+  const outbox = rankingConn.collection(OUTBOX);
+
+  // Asked before anything is claimed, so mail queued while this install cannot
+  // send simply waits — and the reason is on record for whoever goes looking.
+  const unavailable = mailUnavailableReason();
+  if (unavailable) {
+    await stampHeartbeat(outbox, "standing down", unavailable);
+    return { ran: false, reason: unavailable };
   }
 
-  const outbox = rankingConn.collection(OUTBOX);
   const users = quantumConn.collection("users");
   const finish = (mail, fields) =>
     outbox.updateOne({ _id: mail._id }, { $set: { ...fields, updatedAt: new Date() } });
@@ -121,7 +163,7 @@ const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT } =
     } catch (err) {
       const message = String(err?.message || err).slice(0, 300);
 
-      if (TRANSPORT_ERROR_CODES.has(err?.code)) {
+      if (!isAboutThisMessage(err)) {
         await outbox.updateOne(
           { _id: mail._id },
           {
@@ -146,7 +188,13 @@ const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT } =
     }
   }
 
+  await stampHeartbeat(
+    outbox,
+    `${sent} sent, ${skipped} skipped, ${failed} failed`,
+    transportError,
+  );
+
   return { ran: true, sent, skipped, failed, ...(transportError && { transportError }) };
 };
 
-module.exports = { runMailer, OUTBOX };
+module.exports = { runMailer, OUTBOX, HEARTBEAT_KEY };
