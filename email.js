@@ -1,6 +1,8 @@
 // Mirrors backend/utils/email.js — same env var names (SMTP_HOST/PORT/SECURE/
 // USER/PASS/FROM) so the same .env block works in both places, but this
 // process has its own dependencies and its own .env, so it is not shared code.
+const os = require("os");
+
 function getSmtpConfig() {
   return {
     host: process.env.SMTP_HOST,
@@ -28,14 +30,21 @@ function isSmtpConfigured() {
 // since that looked like the server refusing each message, 25 mails burned all
 // their attempts and were written off. A dependency missing from the folder is
 // a fault of the install, never of a message, so it is asked about up front.
+//
+// The reason names this machine and this folder. "Run npm install in the worker
+// folder" was read on the development machine, where the package was installed
+// all along — there is more than one copy of this folder, and only the one the
+// worker is running from counts.
 function mailUnavailableReason() {
+  const here = `${__dirname} on ${os.hostname()}`;
   if (!isSmtpConfigured()) {
-    return "SMTP is not configured — set SMTP_HOST, SMTP_USER and SMTP_PASS in .env";
+    return `SMTP is not configured — set SMTP_HOST, SMTP_USER and SMTP_PASS in the .env in ${here}`;
   }
   try {
     require.resolve("nodemailer");
   } catch {
-    return "nodemailer is not installed — run `npm install` in the worker folder, then restart";
+    // No restart needed afterwards: this is asked again on every pass.
+    return `nodemailer is not installed in ${here} — open a terminal in that folder, on that machine, and run: npm install`;
   }
   return "";
 }

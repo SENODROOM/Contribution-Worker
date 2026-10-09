@@ -22,6 +22,7 @@
 // Needs the SMTP_* vars (see email.js) and nothing else. Without them the pass
 // stands down and the queue simply waits; a mail still unsent when its
 // `expiresAt` passes is dropped rather than delivered late.
+const os = require("os");
 const { sendEmail, mailUnavailableReason } = require("./email");
 
 const OUTBOX = "emailOutbox";
@@ -85,7 +86,14 @@ const stampHeartbeat = async (outbox, summary, fault = "") => {
     await outbox.updateOne(
       { dedupeKey: HEARTBEAT_KEY },
       {
-        $set: { subject: summary, lastError: fault, updatedAt: now },
+        // host + folder: which copy of the worker is the one actually running.
+        $set: {
+          subject: summary,
+          lastError: fault,
+          updatedAt: now,
+          host: os.hostname(),
+          folder: __dirname,
+        },
         $setOnInsert: { kind: "heartbeat", status: "done", createdAt: now },
       },
       { upsert: true },
