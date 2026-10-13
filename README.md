@@ -116,9 +116,10 @@ carries a member's id, real name, last login and course list; the endpoint that
 replays this (`/api/polycode/progress/:polycoder`) is public, so the snapshot is
 a whitelist rather than the raw objects.
 
-`5 XP = 1 quantum point`, floored **per day** — matching
-`backend/utils/polycodeProgress.js polycodeXpToPoints`. Summing XP across days
-before flooring would inflate totals.
+`5 XP = 1 quantum point`, floored **per day** and capped at 100 a day (500 XP)
+— scored by `backend/utils/polycodeProgress.js polycodeXpToPoints`, not here:
+the ledger keeps a day's full XP, so the cap can change without a re-sweep.
+Summing XP across days before converting would inflate totals.
 
 ## What the Digital Logics Studio pass does
 
@@ -136,9 +137,21 @@ Optional — it stands down until `DLS_SYNC_SECRET` is set.
 
 `5 XP = 1 quantum point`, floored per day and capped at 100 a day — scored by
 `backend/utils/dlsPoints.js`, not here. A wrong or missing secret fails the
-whole pass loudly and leaves the heartbeat untouched, so a broken pass never
-looks fresh. `node backend/scripts/checkDlsLedger.js` (from the backend) shows
-whether rows are landing.
+whole pass loudly and leaves the heartbeat's `lastRunAt` untouched, so a broken
+pass never looks fresh; the reason is written beside it as `lastError` (also
+when `DLS_SYNC_SECRET` is simply unset here) and cleared by the next clean pass.
+`node backend/scripts/checkDlsLedger.js` (from the backend) prints that reason,
+asks the DLS backend whether its half of the secret is set, and shows whether
+rows are landing.
+
+Switching it on takes both halves, and the second is the one that gets missed:
+
+1. `DLS_SYNC_SECRET=<value>` in this folder's `.env` **on the host the worker
+   runs on**, then restart the worker.
+2. `COMMUNITY_SYNC_SECRET=<same value>` on the Vercel project behind
+   `digital-logics-studio-backend.vercel.app` (Settings → Environment Variables,
+   Production), then **redeploy** it — a variable added in Vercel only reaches
+   deployments made afterwards. Until then the endpoint answers `503`.
 
 ## What the mailer does
 

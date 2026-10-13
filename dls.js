@@ -23,7 +23,10 @@
 //
 // OPTIONAL, and off unless configured. Set DLS_SYNC_SECRET to the value of
 // COMMUNITY_SYNC_SECRET on the DLS backend; until then this pass stands down
-// silently and DLS simply scores nothing.
+// and DLS simply scores nothing. Both halves have to be set — the DLS one in
+// that Vercel project's environment, followed by a redeploy — and whichever is
+// missing is recorded on the heartbeat doc (recordFault) for
+// backend/scripts/checkDlsLedger.js to print.
 
 const DLS_API_URL = (
   process.env.DLS_API_URL || "https://digital-logics-studio-backend.vercel.app"
@@ -159,6 +162,27 @@ const buildOps = (userId, account) => {
   return { ops, days };
 };
 
+// Why the pass is not landing data, on the heartbeat doc — and never lastRunAt,
+// which is what marks the ledger fresh. Without this a pass that could not run
+// looked exactly like one nobody had switched on: the reason only reached this
+// host's log. DLS scored nothing for its first six days (2026-10-07 → 13)
+// because COMMUNITY_SYNC_SECRET had never been set on the DLS deployment, and
+// nothing on the portal side could say so.
+const recordFault = async (collection, message) => {
+  try {
+    await collection.updateOne(
+      { userId: HEARTBEAT_KEY, date: "meta" },
+      {
+        $set: { lastError: message, lastErrorAt: new Date() },
+        $setOnInsert: { userId: HEARTBEAT_KEY, date: "meta" },
+      },
+      { upsert: true },
+    );
+  } catch (err) {
+    console.warn(`[dls] could not record the failure: ${err.message}`);
+  }
+};
+
 /**
  * Refresh every matched member's DLS XP.
  *
@@ -167,13 +191,15 @@ const buildOps = (userId, account) => {
  */
 const runDlsSweep = async ({ quantumConn, rankingConn }) => {
   const secret = process.env.DLS_SYNC_SECRET;
+  const collection = rankingConn.collection("dlsStats");
   if (!secret) {
     // Not an error: DLS scoring is opt-in. Reported so a manual `npm run dls`
-    // says why nothing happened.
+    // says why nothing happened, and recorded so the portal side can tell
+    // "switched off here" from "DLS refused us".
+    await recordFault(collection, "DLS_SYNC_SECRET is not set on the worker");
     return { ran: false, reason: "not configured (DLS_SYNC_SECRET)" };
   }
 
-  const collection = rankingConn.collection("dlsStats");
   const userIdByEmail = await enumerateMembers({ quantumConn });
   const emails = [...userIdByEmail.keys()];
 
@@ -181,6 +207,7 @@ const runDlsSweep = async ({ quantumConn, rankingConn }) => {
   let days = 0;
   let changed = 0;
   let failed = 0;
+  let lastBatchError = null;
 
   for (let index = 0; index < emails.length; index += EMAILS_PER_REQUEST) {
     const batch = emails.slice(index, index + EMAILS_PER_REQUEST);
@@ -199,10 +226,15 @@ const runDlsSweep = async ({ quantumConn, rankingConn }) => {
         changed += (result.upsertedCount || 0) + (result.modifiedCount || 0);
       }
     } catch (err) {
-      // No heartbeat on a fatal error: the pass did not really run, and a fresh
-      // heartbeat would hide that from anyone checking the ledger.
-      if (err.fatal) throw err;
+      // No lastRunAt on a fatal error: the pass did not really run, and a fresh
+      // heartbeat would hide that from anyone checking the ledger. Only the
+      // reason is recorded.
+      if (err.fatal) {
+        await recordFault(collection, err.message);
+        throw err;
+      }
       failed += 1;
+      lastBatchError = err.message;
       console.warn(`[dls] batch ${index / EMAILS_PER_REQUEST + 1} failed: ${err.message}`);
     }
 
@@ -215,7 +247,16 @@ const runDlsSweep = async ({ quantumConn, rankingConn }) => {
   await collection.updateOne(
     { userId: HEARTBEAT_KEY, date: "meta" },
     {
-      $set: { lastRunAt: now, updatedAt: now, members: emails.length, accounts, failed },
+      $set: {
+        lastRunAt: now,
+        updatedAt: now,
+        members: emails.length,
+        accounts,
+        failed,
+        // Cleared by a clean pass, so what is left is always the current reason.
+        lastError: lastBatchError,
+        ...(lastBatchError ? { lastErrorAt: now } : {}),
+      },
       $setOnInsert: { userId: HEARTBEAT_KEY, date: "meta" },
     },
     { upsert: true },
