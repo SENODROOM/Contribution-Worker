@@ -16,7 +16,10 @@
     "pm2:stop": "pm2 stop contribution-worker",
     "pm2:restart": "pm2 restart contribution-worker",
     "pm2:logs": "pm2 logs contribution-worker",
-    "pm2:status": "pm2 status contribution-worker"
+    "pm2:status": "pm2 status contribution-worker",
+    "mail:preview": "node previewMemberEmails.js",
+    "mail:repair:dry": "node repairFailedEmails.js --dry-run",
+    "mail:repair": "node repairFailedEmails.js"
   },
   "engines": {
     "node": ">=18"

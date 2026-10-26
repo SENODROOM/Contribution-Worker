@@ -14,13 +14,12 @@
 // the board that announced it. So this triggers the backend endpoint that reuses
 // those exact loaders.
 //
-// It does not email the winners either, though it used to. The backend queues a
-// congratulation for every medal the moment a window is decided
-// (backend/utils/medalEmails.js) and mailer.js delivers it — which is what lets
-// the mail go out whichever of the two triggers decided the window, and for
-// every medal rather than first place alone. The same call also runs the weekly
-// role-alert sweep on the backend, so a configured worker is what makes both
-// land at midnight exactly.
+// Emailing the winners is not done here, but it is this worker's job all the
+// same: mailSweeps.js notices a window's decision row on its next pass —
+// whichever of the two triggers decided it — and queues one congratulation per
+// winner for every medal, which mailer.js sends from admin@. The backend queues
+// and sends nothing. The weekly role-alert sweep is the same worker's too, so
+// both land within a minute of the midnight cutover.
 //
 // OPTIONAL, and off unless configured. Set PORTAL_API_URL (the portal backend's
 // origin) plus the secret its /api/cron/* routes accept — CRON_SECRET if that

@@ -1,12 +1,12 @@
 // Member email delivery.
 //
-// The portal backend never sends a member's mail itself. It queues each one in
-// ranking.emailOutbox (backend/models/EmailOutbox.js) — a weekly "your position
-// is at risk" alert, "you are no longer Project Captain", "you won the Daily
-// Achiever medal" — already rendered and named by a dedupe key, and this pass
-// delivers them. The split is the same one the ledgers make: the backend is
-// serverless and cannot be trusted to finish work after a response, and this is
-// the process that runs all day and holds the admin@ mailbox.
+// The portal backend neither sends nor queues a member's mail. This worker
+// decides every one (mailProducers.js: a weekly "your position is at risk"
+// alert, "you are no longer Project Captain", "you won the Daily Achiever
+// medal"), writes it to ranking.emailOutbox already rendered and named by a
+// dedupe key, and this pass delivers it. The backend is serverless and cannot
+// be trusted to finish work after a response; this is the process that runs all
+// day and holds the admin@ mailbox.
 //
 // So this file knows nothing about what a mail says or why it was queued. It
 // claims the oldest due mail, looks up the member's current address, sends, and
@@ -107,16 +107,19 @@ const stampHeartbeat = async (outbox, summary, fault = "") => {
  * Deliver what is due in the outbox.
  *
  * @param {{ quantumConn: import("mongoose").Connection, rankingConn: import("mongoose").Connection }} connections
+ * @param {{ limit?: number, note?: string }} [options] `note` is what the producers
+ *   (mailProducers.js) had to say this pass; it rides on the heartbeat so
+ *   checkEmailOutbox.js shows it beside "sent".
  * @returns {Promise<{ ran: boolean, reason?: string, sent?: number, skipped?: number, failed?: number, transportError?: string }>}
  */
-const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT } = {}) => {
+const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT, note = "" } = {}) => {
   const outbox = rankingConn.collection(OUTBOX);
 
   // Asked before anything is claimed, so mail queued while this install cannot
   // send simply waits — and the reason is on record for whoever goes looking.
   const unavailable = mailUnavailableReason();
   if (unavailable) {
-    await stampHeartbeat(outbox, "standing down", unavailable);
+    await stampHeartbeat(outbox, `standing down${note ? ` · ${note}` : ""}`, unavailable);
     return { ran: false, reason: unavailable };
   }
 
@@ -198,7 +201,7 @@ const runMailer = async ({ quantumConn, rankingConn }, { limit = BATCH_LIMIT } =
 
   await stampHeartbeat(
     outbox,
-    `${sent} sent, ${skipped} skipped, ${failed} failed`,
+    `${sent} sent, ${skipped} skipped, ${failed} failed${note ? ` · ${note}` : ""}`,
     transportError,
   );
 

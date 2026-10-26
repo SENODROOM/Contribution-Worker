@@ -155,10 +155,25 @@ Switching it on takes both halves, and the second is the one that gets missed:
 
 ## What the mailer does
 
-Sends every email the portal owes a member, from
-`admin@quantumlogicslimited.com`. The backend never sends one itself — it queues
-them in `ranking.emailOutbox`, already written, and `mailer.js` delivers what is
-due every `MAILER_INTERVAL_MINUTES` (default 1):
+Decides, queues and sends every email the portal owes a member, from
+`admin@quantumlogicslimited.com`. **The backend neither sends nor queues any
+member mail.** Every `MAILER_INTERVAL_MINUTES` (default 1) the worker first
+works out what is owed (`mailProducers.js`), writes it to `ranking.emailOutbox`
+already written, and `mailer.js` delivers what is due:
+
+- `mailActivity.js` — reads new rows of `ranking.communityActivities`
+  (promotions, removals, moves, bans, rejected appeals);
+- `mailIdeas.js` — reads new `ranking.ideaComments` (a comment on your idea);
+- `mailSweeps.js` — medal congratulations when a window is decided, and the
+  weekly role alerts on the Monday after a week closes. These two ask the
+  backend (`GET /api/cron/mail-facts/*`), so they need **`PORTAL_API_URL` and
+  `CRON_SECRET`/`JWT_SECRET`** set, as the midnight finalize does.
+
+Also needs `CLIENT_URL` (the deployed portal) for the buttons inside a mail.
+`npm run mail:preview` renders every template to disk; `npm run mail:repair:dry`
+shows what bringing failed mail back would do.
+
+What is sent:
 
 - **role alerts** — once a week, each Team Captain, Project Captain or Commander
   failing a rule that keeps their seat ("you uploaded 1 of the 3 required

@@ -19,6 +19,7 @@ const { runDlsSweep } = require("./dls");
 const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 const { runLeaderboardRebuild } = require("./leaderboard");
 const { runMailer } = require("./mailer");
+const { runMailProducers } = require("./mailProducers");
 
 // This worker owns every recurring GitHub and PolyCode call for the portal. The
 // backend is deployed on Vercel and only reads what lands here — it makes no
@@ -55,11 +56,13 @@ const { runMailer } = require("./mailer");
 // request (a public profile view in particular) reads one indexed doc instead
 // of rebuilding the whole community's board inline.
 //
-// Plus mail delivery (mailer.js): every MAILER_INTERVAL_MINUTES (default 1) the
-// emails the backend has queued for members in ranking.emailOutbox — role
-// alerts, promotions and removals, medal congratulations — are sent from
-// admin@. The backend only queues; if this process stops, no member is mailed
-// until it is back, and anything that went stale in the meantime is dropped.
+// Plus every member email (mailProducers.js, mailer.js): each
+// MAILER_INTERVAL_MINUTES (default 1) this decides which emails are owed —
+// role alerts, promotions and removals, medal congratulations, idea comments —
+// queues them in ranking.emailOutbox and sends them from admin@. The backend
+// neither sends nor queues any of it; if this process stops, no member is
+// mailed until it is back, and anything that went stale in the meantime is
+// dropped (the producers look back a day for events, three for medals).
 
 const quantumUri = process.env.MONGO_URI_QUANTUM;
 const rankingUri = process.env.MONGO_RANKING_URI;
@@ -166,6 +169,9 @@ let mailerRunning = false;
 // The last SMTP-level failure reported and when, so an outage that fails every
 // one-minute tick the same way is a line every half hour, not 1,440 a day.
 const mailerFault = { message: "", at: 0 };
+// The same for what the producers report, keyed by the whole text so a new
+// problem is said at once and a lasting one every half hour.
+const producerFault = { message: "", at: 0 };
 // Which PKT date the finalize has already been settled for. In memory only: the
 // endpoint is idempotent, so the worst a restart costs is one redundant request
 // that reports nothing to do.
@@ -298,7 +304,31 @@ const runMail = async () => {
   if (mailerRunning) return;
   mailerRunning = true;
   try {
-    const result = await runMailer(connections);
+    // Decide what is owed first, so a mail queued this tick can go out in it.
+    // A producer that fails never stops delivery of what is already queued.
+    let produced = { queued: 0, problems: [], notes: [] };
+    try {
+      produced = await runMailProducers(connections);
+    } catch (err) {
+      produced.problems.push(err.message);
+    }
+    if (produced.queued > 0) {
+      console.log(`[mail] ${produced.queued} email(s) queued`);
+    }
+    const said = [...produced.problems, ...produced.notes].join(" | ");
+    if (said) {
+      const repeat =
+        said === producerFault.message && Date.now() - producerFault.at < 30 * 60 * 1000;
+      if (!repeat) {
+        producerFault.message = said;
+        producerFault.at = Date.now();
+        console.warn(`[mail] ${said}`);
+      }
+    } else {
+      producerFault.message = "";
+    }
+
+    const result = await runMailer(connections, { note: said.slice(0, 280) });
     if (result.ran && (result.sent > 0 || result.skipped > 0 || result.failed > 0)) {
       console.log(
         `[mailer] ${result.sent} sent` +
@@ -383,6 +413,8 @@ const shutdown = async (signal) => {
   }
 
   if (mailerOnly) {
+    const produced = await runMailProducers(connections);
+    console.log(`[mail] ${JSON.stringify(produced)}`);
     const result = await runMailer(connections);
     console.log(`[mailer] ${JSON.stringify(result)}`);
     await connections.close();
