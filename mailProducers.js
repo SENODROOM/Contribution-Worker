@@ -5,7 +5,7 @@
 // one process owns the whole path:
 //
 //   mailActivity.js  promotions, removals, team moves, bans, rejected appeals
-//   mailIdeas.js     a comment on your idea
+//   mailIdeas.js     a comment on your idea, and an SE's decision on it
 //   mailSweeps.js    medal congratulations at each window's close, and the
 //                    weekly role alerts
 //
@@ -13,7 +13,7 @@
 // is reported and the others still run. Nothing here sends.
 const { ensureOutboxIndexes } = require("./mailQueue");
 const { runActivityMail } = require("./mailActivity");
-const { runIdeaMail } = require("./mailIdeas");
+const { runIdeaMail, runIdeaDecisionMail } = require("./mailIdeas");
 const { runMedalSweep, runRoleAlertSweep } = require("./mailSweeps");
 
 let indexesEnsured = false;
@@ -39,6 +39,7 @@ const runMailProducers = async (ctx) => {
   const producers = [
     ["activity", runActivityMail],
     ["ideas", runIdeaMail],
+    ["idea decisions", runIdeaDecisionMail],
     ["medals", runMedalSweep],
     ["role alerts", runRoleAlertSweep],
   ];

@@ -574,6 +574,47 @@ const clip = (value, max) => {
  * text arriving in a mail from admin@, so it is shown as a quote under their
  * name and nowhere else — never in the subject line.
  */
+// What an SE decided about an idea. `outcome` is where the idea now stands:
+// approved (going ahead), completed (built) or declined (not going ahead).
+// Ignored ideas are never mailed (see mailIdeas.js). Says what the decision is
+// and where to follow the idea; it does not name who decided.
+const IDEA_OUTCOMES = Object.freeze({
+  approved: {
+    subject: "Your idea was approved",
+    tone: "success",
+    line: (title) => `Good news — your idea **${title}** was **approved**. It is going ahead.`,
+    closing: "You can follow it, and keep voting and commenting, on the ideas board.",
+  },
+  completed: {
+    subject: "Your idea was completed",
+    tone: "success",
+    line: (title) => `Your idea **${title}** is now **completed** — it has been built. Thank you for suggesting it.`,
+    closing: "It stays on the ideas board under Completed.",
+  },
+  declined: {
+    subject: "Your idea was not approved",
+    tone: "info",
+    line: (title) =>
+      `Your idea **${title}** was reviewed and was **not approved** — it will not be going ahead for now.`,
+    closing:
+      "Thank you for sharing it. It stays on the ideas board under Closed, and every idea you share helps shape what we build next.",
+  },
+});
+
+const ideaDecisionEmail = ({ name, ideaTitle, outcome }) => {
+  const spec = IDEA_OUTCOMES[outcome] || IDEA_OUTCOMES.declined;
+  const title = clip(ideaTitle, 80) || "your idea";
+  return renderMemberEmail({
+    subject: spec.subject,
+    heading: spec.subject,
+    name,
+    tone: spec.tone,
+    paragraphs: [spec.line(title)],
+    closing: [spec.closing],
+    cta: { label: "Open the ideas board", path: "/explore#ideas" },
+  });
+};
+
 const ideaCommentEmail = ({ name, commenterName, ideaTitle, commentBody, commentCount = 0 }) => {
   const who = String(commenterName || "").trim() || "A community member";
   const title = clip(ideaTitle, 80) || "your idea";
@@ -614,4 +655,5 @@ module.exports = {
   accountEmail,
   appealRejectedEmail,
   ideaCommentEmail,
+  ideaDecisionEmail,
 };

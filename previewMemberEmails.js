@@ -27,6 +27,7 @@ const {
   accountEmail,
   appealRejectedEmail,
   ideaCommentEmail,
+  ideaDecisionEmail,
 } = require("./mailTemplates");
 
 const failing = {
@@ -175,6 +176,9 @@ const SAMPLES = {
     appealType: "promotion",
     reviewerName: "Hamza Tariq",
   }),
+  "idea-approved": ideaDecisionEmail({ name: "Hamza Ali", ideaTitle: "Weekly code-review sessions", outcome: "approved" }),
+  "idea-completed": ideaDecisionEmail({ name: "Hamza Ali", ideaTitle: "Weekly code-review sessions", outcome: "completed" }),
+  "idea-declined": ideaDecisionEmail({ name: "Hamza Ali", ideaTitle: "Weekly code-review sessions", outcome: "declined" }),
   "idea-comment": ideaCommentEmail({
     name: "Ayesha Khan",
     commenterName: "Usman Raza",

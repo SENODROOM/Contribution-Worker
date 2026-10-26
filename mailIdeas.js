@@ -1,3 +1,7 @@
+// Two mails about an idea, both read from the database a minute after the fact:
+// "someone commented on your idea" (runIdeaMail) and "your idea was approved /
+// completed / not approved / closed" (runIdeaDecisionMail, at the end).
+//
 // "Someone commented on your idea".
 //
 // Read from ranking.ideaComments a minute after a comment is posted — the
@@ -19,7 +23,7 @@
 // a minute or so after the comment; the backend read it back from its own $inc.
 const mongoose = require("mongoose");
 const { queueMemberEmail, readCursor, writeCursor } = require("./mailQueue");
-const { ideaCommentEmail } = require("./mailTemplates");
+const { ideaCommentEmail, ideaDecisionEmail } = require("./mailTemplates");
 
 const { ObjectId } = mongoose.Types;
 
@@ -126,4 +130,101 @@ const runIdeaMail = async (ctx) => {
   return { queued, handled: batch.length, ...(problem && { problem }) };
 };
 
-module.exports = { runIdeaMail };
+// ─── The outcome of an idea ──────────────────────────────────────────────────
+//
+// A Software Engineer approving, completing or closing an idea stamps
+// `decidedAt` on it (backend routes/ideas.js PATCH /:ideaId/status — the whole of
+// the backend's part), and the author is told here so they do not have to ask
+// for an update. Where the idea stands decides the wording: approved,
+// completed, or closed as declined. **Ignore sends nothing** (the user,
+// 2026-10-27): it sets an idea aside without a verdict, so there is no outcome to
+// report. A reopen is not announced either.
+//
+// One mail per idea per outcome, whatever the flip-flopping: an SE who approves,
+// unapproves and approves again does not mail the author three times. A decision
+// the author took themselves (an SE closing their own idea) mails nobody, and
+// ideas decided before the field existed have no `decidedAt` and are never
+// mailed. The cursor is a date, `__cursor__:ideaDecisions`, trailing the clock by
+// a minute so a decision stamped by a server whose clock runs behind is not
+// stepped over; the first ever run looks back a day.
+const DECISION_CURSOR_KEY = "__cursor__:ideaDecisions";
+const DECISION_EXPIRY_DAYS = 7;
+const decisionFailures = new Map();
+
+const outcomeOf = (idea) => {
+  if (idea.status === "approved") return "approved";
+  if (idea.status === "closed" && ["completed", "declined"].includes(idea.closedReason)) {
+    return idea.closedReason;
+  }
+  return "";
+};
+
+/**
+ * @param {{ quantumConn: import("mongoose").Connection, rankingConn: import("mongoose").Connection }} ctx
+ * @returns {Promise<{ queued: number, handled: number, problem?: string }>}
+ */
+const runIdeaDecisionMail = async (ctx) => {
+  const ideas = ctx.rankingConn.collection("ideas");
+  const users = ctx.quantumConn.collection("users");
+
+  const upper = new Date(Date.now() - LAG_MS);
+  let cursor = await readCursor(ctx.rankingConn, DECISION_CURSOR_KEY);
+  if (!cursor) cursor = new Date(Date.now() - FIRST_RUN_LOOKBACK_MS);
+
+  const batch = await ideas
+    .find({ decidedAt: { $gt: new Date(cursor), $lte: upper } })
+    .sort({ decidedAt: 1 })
+    .limit(BATCH)
+    .toArray();
+
+  let queued = 0;
+  let advanceTo = batch.length === BATCH ? batch[batch.length - 1].decidedAt : upper;
+  let problem = "";
+
+  for (const idea of batch) {
+    try {
+      // Read at mail time, not at decision time: an idea approved and reopened
+      // inside the minute is open again, and no mail is owed for it.
+      const outcome = outcomeOf(idea);
+      const authorId = String(idea.authorUserId || "");
+      if (!outcome || !ObjectId.isValid(authorId)) continue;
+      // An SE deciding their own idea knows what they decided.
+      if (String(idea.decidedByUserId || "") === authorId) continue;
+
+      const author = await users.findOne(
+        { _id: new ObjectId(authorId) },
+        { projection: { name: 1 } },
+      );
+      if (!author) continue;
+
+      const result = await queueMemberEmail(ctx.rankingConn, {
+        userId: author._id,
+        kind: "idea_decision",
+        dedupeKey: `idea-decision:${idea._id}:${outcome}`,
+        email: ideaDecisionEmail({ name: author.name, ideaTitle: idea.title, outcome }),
+        expiresInDays: DECISION_EXPIRY_DAYS,
+      });
+      if (result.queued) queued += 1;
+      if (result.reason === "ERROR") throw new Error("could not write to the outbox");
+    } catch (err) {
+      const id = String(idea._id);
+      const failures = (decisionFailures.get(id) || 0) + 1;
+      decisionFailures.set(id, failures);
+      console.warn(`[mail] idea decision ${id} attempt ${failures} failed: ${err.message}`);
+      if (failures < MAX_ROW_FAILURES) {
+        problem = `idea decision ${id}: ${err.message}`;
+        advanceTo = batch[batch.indexOf(idea) - 1]?.decidedAt || cursor;
+        break;
+      }
+      decisionFailures.delete(id);
+      problem = `gave up on idea decision ${id}: ${err.message}`;
+    }
+  }
+
+  if (new Date(advanceTo).getTime() !== new Date(cursor).getTime()) {
+    await writeCursor(ctx.rankingConn, DECISION_CURSOR_KEY, new Date(advanceTo));
+  }
+  return { queued, handled: batch.length, ...(problem && { problem }) };
+};
+
+module.exports = { runIdeaMail, runIdeaDecisionMail };
