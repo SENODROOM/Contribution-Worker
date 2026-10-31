@@ -18,6 +18,7 @@ const { runPolycodeSweep } = require("./polycode");
 const { runDlsSweep } = require("./dls");
 const { runAchieverFinalize, FINALIZE_HOUR_PKT } = require("./achievers");
 const { runLeaderboardRebuild } = require("./leaderboard");
+const { runEventCheck } = require("./eventCheck");
 const { runMailer } = require("./mailer");
 const { runMailProducers } = require("./mailProducers");
 
@@ -44,6 +45,10 @@ const { runMailProducers } = require("./mailProducers");
 //   dls      — every DLS_INTERVAL_MINUTES (default 5). Digital Logics Studio XP
 //              for every member, a handful of batched requests to our own DLS
 //              backend. Optional: stands down without DLS_SYNC_SECRET.
+//
+// Plus the event check (eventCheck.js): every EVENT_CHECK_INTERVAL_MINUTES
+// (default 5), each pending Events tab submission is cloned, and approved if its
+// repo passes. This needs git on the machine; the backend, on Vercel, cannot do it.
 //
 // Plus one scheduled decision (achievers.js): once a day, just after the
 // Pakistan-time cutover, the finished day's winners are frozen into
@@ -150,7 +155,11 @@ const leaderboardIntervalMs =
 // a member told "you are no longer Project Captain" should not hear it late.
 const mailerIntervalMs =
   (Number(process.env.MAILER_INTERVAL_MINUTES) || 1) * 60 * 1000;
+// A member is waiting on this, and an empty queue costs one indexed lookup.
+const eventCheckIntervalMs =
+  (Number(process.env.EVENT_CHECK_INTERVAL_MINUTES) || 5) * 60 * 1000;
 const runOnce = process.argv.includes("--once");
+const eventsOnly = process.argv.includes("--events");
 const recentOnly = process.argv.includes("--recent");
 const polycodeOnly = process.argv.includes("--polycode");
 const dlsOnly = process.argv.includes("--dls");
@@ -166,6 +175,7 @@ let dlsRunning = false;
 let achieverRunning = false;
 let leaderboardRunning = false;
 let mailerRunning = false;
+let eventCheckRunning = false;
 // The last SMTP-level failure reported and when, so an outage that fails every
 // one-minute tick the same way is a line every half hour, not 1,440 a day.
 const mailerFault = { message: "", at: 0 };
@@ -298,6 +308,27 @@ const runLeaderboardSnapshot = async () => {
   }
 };
 
+const runEvents = async () => {
+  if (eventCheckRunning) return;
+  eventCheckRunning = true;
+  try {
+    const result = await runEventCheck(connections);
+    if (!result.ran) {
+      console.error(`[events] NOT CHECKING — submissions are waiting: ${result.reason}`);
+    } else if (result.checked > 0) {
+      console.log(`[events] ${result.checked} checked, ${result.approved} approved`);
+    }
+    // Approvals move points, so refresh the board rather than wait up to ten
+    // minutes for its next turn.
+    if (result.approved > 0) await runLeaderboardSnapshot();
+    return result;
+  } catch (err) {
+    console.error("[worker] event check failed:", err.message);
+  } finally {
+    eventCheckRunning = false;
+  }
+};
+
 const runMail = async () => {
   // Its own upstream (the SMTP server) and its own collection; a tick that
   // finds the last one still sending just waits for the next.
@@ -421,6 +452,13 @@ const shutdown = async (signal) => {
     process.exit(0);
   }
 
+  if (eventsOnly) {
+    const result = await runEvents();
+    console.log(`[events] ${JSON.stringify(result)}`);
+    await connections.close();
+    process.exit(0);
+  }
+
   if (runOnce) {
     await runPolycode();
     await runDls();
@@ -490,6 +528,12 @@ const shutdown = async (signal) => {
       ? "[worker] leaderboard snapshot not configured — cold requests will rebuild it live instead"
       : `[worker] leaderboard snapshot refreshed every ${leaderboardIntervalMs / 60000}min`
   );
+
+  const eventProbe = await runEvents();
+  setInterval(runEvents, eventCheckIntervalMs);
+  if (eventProbe?.ran !== false) {
+    console.log(`[worker] event submissions checked every ${eventCheckIntervalMs / 60000}min`);
+  }
 
   await runFull();
   setInterval(runFull, fullIntervalMs);

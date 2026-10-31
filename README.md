@@ -153,6 +153,26 @@ Switching it on takes both halves, and the second is the one that gets missed:
    Production), then **redeploy** it — a variable added in Vercel only reaches
    deployments made afterwards. Until then the endpoint answers `503`.
 
+## What the event check does
+
+Every `EVENT_CHECK_INTERVAL_MINUTES` (default 5), `eventCheck.js` takes pending
+submissions from the portal's Events tab (`ranking.eventSubmissions`), clones each
+repo and approves the ones that pass. The backend is on Vercel and cannot clone, so
+this is the only place it happens. **This machine needs `git` on its PATH**; without
+it the pass stands down, logs `NOT CHECKING`, and marks nothing. No new env vars.
+
+A row is approved when every file is `.sa` or an ordinary project file (README,
+license, `package.json` / `qpm.json` / `package.qon`, `.gitignore`, `.gitattributes`)
+with at least one `.sa`, the repo is under the member's linked GitHub account and is
+not a fork, qpm has the package and names no other repo, and nothing approved has
+already earned on that package or repo. Anything else stays pending for a Software
+Engineer with the reason on it: this pass never rejects.
+
+Only file names are read (`--bare --depth=1 --filter=blob:none`, no token), so nothing
+a member wrote lands on this machine or runs, and a private repo simply cannot be
+checked. `npm run events` forces one pass; `node backend/scripts/checkEventSubmissions.js`
+on any machine with the backend's env shows the last run and each row's result.
+
 ## What the mailer does
 
 Decides, queues and sends every email the portal owes a member, from
